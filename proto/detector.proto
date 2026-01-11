@@ -1,0 +1,169 @@
+syntax = "proto3";
+
+package autocare;
+
+// Hailo Object Detection 서비스 (Core 프로토콜 호환)
+service Detector {
+  // ========== App (모델) 관리 ==========
+  rpc InstallApp(stream AppReq) returns (AppRes);
+  rpc UninstallApp(AppReq) returns (AppRes);
+  rpc GetAppList(AppReq) returns (AppList);
+
+  // ========== Camera (카메라) 관리 ==========
+  rpc AddCamera(CameraReq) returns (CameraRes);
+  rpc RemoveCamera(CameraReq) returns (CameraRes);
+  rpc GetCameraList(CameraReq) returns (CameraList);
+  rpc GetCamera(CameraReq) returns (CameraRes);
+
+  // ========== Inference (모델 연결) 관리 ==========
+  rpc AddInference(InferenceReq) returns (InferenceRes);
+  rpc RemoveInference(InferenceReq) returns (InferenceRes);
+  rpc RemoveInferenceAll(AppReq) returns (AppRes);
+  rpc UpdateInference(InferenceReq) returns (InferenceRes);
+  rpc GetInferenceStatus(InferenceReq) returns (InferenceRes);
+  rpc GetInferenceStatusAll(AppReq) returns (InferenceResList);
+  rpc GetInferenceList(InferenceReq) returns (InferenceList);
+  rpc RequestPreviewImage(InferenceReq) returns (InferenceRes);
+
+  // ========== Event (이벤트 설정) 관리 ==========
+  rpc UpdateEventSetting(EventSettingReq) returns (EventSettingRes);
+  rpc ClearEventSetting(EventSettingReq) returns (EventSettingRes);
+}
+
+// ============================================================================
+// App (모델)
+// ============================================================================
+
+message AppReq {
+  string app_id = 1;
+  bytes chunk = 2;
+}
+
+message AppRes {
+  bool result = 1;
+}
+
+message App {
+  string id = 1;
+  string name = 2;
+  repeated Model models = 3;
+  string desc = 4;
+  string version = 5;
+  string date = 6;                     // 등록일
+  string framework = 7;                // "hailo"
+}
+
+message ModelOutput {
+  string label = 1;                    // 라벨 (예: "person", "car")
+  repeated string classifiers = 2;    // 분류기 목록
+}
+
+message Model {
+  string id = 1;
+  string name = 2;
+  string path = 3;                     // HEF 경로
+  string platform = 4;                 // "hailo8"
+  string framework = 5;                // "hailo"
+  string desc = 6;
+  int32 ref_count = 7;                 // 사용 중인 inference 수
+  repeated ModelOutput outputs = 8;    // 출력 라벨 정보
+}
+
+message AppList {
+  repeated App app = 1;
+}
+
+// ============================================================================
+// Camera (카메라)
+// ============================================================================
+
+message CameraReq {
+  string camera_id = 1;
+  string uri = 2;                      // RTSP URI
+  string name = 3;
+  string settings = 4;                 // JSON: {"width":1920,"height":1080,"fps":30}
+}
+
+message CameraRes {
+  bool result = 1;
+  string camera_id = 2;
+  int32 status = 3;                    // 0=NG, 1=READY, 2=CONNECTING, 3=CONNECTED
+  string message = 4;                  // 에러 메시지
+}
+
+message Camera {
+  string id = 1;
+  string uri = 2;
+  string name = 3;
+  int32 status = 4;                    // 0=NG, 1=READY, 2=CONNECTING, 3=CONNECTED
+  double fps = 5;
+  int64 frame_count = 6;
+  string app_id = 7;                   // 연결된 모델 (없으면 빈 문자열)
+  int64 uptime_seconds = 8;
+}
+
+message CameraList {
+  repeated Camera cameras = 1;
+}
+
+// ============================================================================
+// Inference (모델 연결)
+// ============================================================================
+
+message InferenceReq {
+  string app_id = 1;
+  string stream_id = 2;
+  string uri = 3;                      // RTSP URI
+  string settings = 4;                 // JSON: {"width":1920,"height":1080,"fps":30,"confidence_threshold":0.5}
+  string name = 5;
+}
+
+message InferenceRes {
+  int32 count = 1;                     // 영향받은 개수
+  int32 status = 2;                    // 0=NG, 1=READY, 2=CONNECTING, 3=CONNECTED
+  bool eos = 3;
+  bool err = 4;
+  string meta = 5;                     // JSON (에러 메시지 등)
+  bytes snapshot = 6;
+  string app_id = 7;
+  string stream_id = 8;
+}
+
+message Inference {
+  string app_id = 1;
+  string stream_id = 2;
+  string uri = 3;
+  string name = 4;
+  int32 status = 5;
+  string settings = 6;
+  int64 frame_count = 7;
+  double current_fps = 8;
+  int64 uptime_seconds = 9;
+  string last_error = 10;
+}
+
+message InferenceList {
+  repeated Inference inferences = 1;
+}
+
+message InferenceResList {
+  repeated InferenceRes res = 1;
+}
+
+message Empty {}
+
+// ============================================================================
+// Event (이벤트 설정)
+// ============================================================================
+
+message EventSettingReq {
+  string stream_id = 1;              // 대상 스트림 ID
+  string app_id = 2;                 // 앱 ID
+  string settings_json = 3;          // InferenceSettings JSON 문자열
+}
+
+message EventSettingRes {
+  bool result = 1;                   // 성공 여부
+  string message = 2;                // 결과/에러 메시지
+  repeated string term_ev_list = 3;  // 터미널 이벤트 ID 목록
+}

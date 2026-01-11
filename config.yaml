@@ -1,0 +1,66 @@
+# Stream Processing Daemon Configuration
+# =======================================
+
+# NATS 메시지 브로커 설정
+nats:
+  url: "nats://localhost:4223"
+  auto_reconnect: true
+  reconnect_interval_seconds: 5
+  max_reconnect_attempts: 0      # 0 = 무제한
+  connection_timeout_ms: 5000
+
+# gRPC API 서버 설정
+grpc:
+  port: 50052
+  bind_address: "0.0.0.0"
+  max_message_size_mb: 4
+  enable_health_check: true
+
+# 스트림 기본 설정 (모델은 반드시 등록된 모델 사용)
+stream:
+  # 비디오 설정
+  width: 1920
+  height: 1080
+  fps: 30
+
+  # 탐지 설정
+  confidence_threshold: 0.5
+
+  # 클래스 필터 (빈 배열이면 모든 클래스 탐지)
+  # 예: ["person", "car", "truck"]
+  class_filter: []
+
+# Hailo NPU 설정
+hailo:
+  device_id: ""                  # 빈 문자열이면 자동 선택
+  batch_size: 1
+  post_process_so: "/usr/lib/hailo-post-processes/libyolo_hailortpp_post.so"
+  function_name: "yolov8"
+
+# GStreamer 설정
+gstreamer:
+  debug_level: 0                 # 0-9 (0=없음, 9=최대)
+  debug_categories: ""           # 예: "hailonet:5,rtspsrc:3"
+  plugin_path: ""                # 추가 플러그인 경로
+  enable_dot_graphs: false       # 파이프라인 DOT 그래프 생성
+  dot_graph_path: "/tmp/gst-dots"
+
+# 로깅 설정
+log:
+  level: "info"                  # debug, info, warning, error
+  file_path: ""                  # 빈 문자열이면 stdout만
+  enable_color: true
+  enable_timestamp: true
+
+# 성능 설정
+performance:
+  max_streams: 4                 # 최대 동시 스트림 수
+  buffer_size: 1                 # appsink 버퍼 크기
+  drop_frames: true              # 느린 처리 시 프레임 드롭
+  rtsp_latency_ms: 0             # RTSP 지연 (0=최소)
+  rtsp_timeout_us: 10000000      # RTSP 타임아웃 (10초)
+  rtsp_retry: 3                  # RTSP 재시도 횟수
+
+# 모델 저장소 설정
+models:
+  models_dir: "/home/snuailab/aiwash/stream-daemon-docs/models"  # 모델 저장 경로

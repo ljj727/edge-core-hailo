@@ -1,0 +1,68 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Model files (large binary files)
+models/
+*.hef
+*.onnx
+*.pt
+*.pth
+*.weights
+*.caffemodel
+
+# Claude Code settings
+.claude/
+
+# CMake files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# Compiled files
+*.o
+*.so
+*.a
+*.dylib
+*.exe
+stream_daemon
+
+# Generated protobuf files
+*.pb.h
+*.pb.cc
+*.grpc.pb.h
+*.grpc.pb.cc
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+
+# Testing
+Testing/
+CTestTestfile.cmake
+
+# Installation
+install_manifest.txt
+
+# Temporary files
+temp_main.cpp
+*.tmp
+
+# Core dumps
+core
+core.*
+
+# Backup files
+*.bak
+*.backup

@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stream Daemon - Real-time Detection Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #16213e, #0f3460);
+            padding: 20px;
+            text-align: center;
+            border-bottom: 2px solid #e94560;
+        }
+
+        .header h1 {
+            font-size: 1.5rem;
+            color: #e94560;
+        }
+
+        .connection-status {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ff6b6b;
+        }
+
+        .status-dot.connected {
+            background: #51cf66;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .controls {
+            padding: 15px 20px;
+            background: #16213e;
+            display: flex;
+            gap: 15px;
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .controls label {
+            font-size: 0.9rem;
+            color: #aaa;
+        }
+
+        .controls input {
+            padding: 8px 12px;
+            border: 1px solid #0f3460;
+            border-radius: 4px;
+            background: #1a1a2e;
+            color: #eee;
+            font-size: 0.9rem;
+        }
+
+        .controls button {
+            padding: 8px 20px;
+            background: #e94560;
+            border: none;
+            border-radius: 4px;
+            color: white;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background 0.2s;
+        }
+
+        .controls button:hover {
+            background: #d63050;
+        }
+
+        .controls button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+
+        .main-container {
+            padding: 20px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+            gap: 20px;
+        }
+
+        .stream-card {
+            background: #16213e;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid #0f3460;
+        }
+
+        .stream-header {
+            padding: 12px 15px;
+            background: #0f3460;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .stream-title {
+            font-weight: bold;
+            color: #e94560;
+        }
+
+        .stream-stats {
+            font-size: 0.8rem;
+            color: #aaa;
+        }
+
+        .stream-canvas-container {
+            position: relative;
+            width: 100%;
+            background: #000;
+        }
+
+        .stream-canvas {
+            width: 100%;
+            display: block;
+        }
+
+        .detection-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+
+        .detection-item {
+            margin: 3px 0;
+            padding: 3px 6px;
+            background: rgba(233, 69, 96, 0.3);
+            border-radius: 2px;
+        }
+
+        .no-streams {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+
+        .logs {
+            margin: 20px;
+            background: #0d0d1a;
+            border-radius: 8px;
+            padding: 15px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.8rem;
+        }
+
+        .log-entry {
+            margin: 3px 0;
+            color: #888;
+        }
+
+        .log-entry.info { color: #51cf66; }
+        .log-entry.error { color: #ff6b6b; }
+        .log-entry.warn { color: #ffd43b; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Stream Daemon - Real-time Detection Viewer</h1>
+        <div class="connection-status">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">Disconnected</span>
+        </div>
+    </div>
+
+    <div class="controls">
+        <label>
+            NATS URL:
+            <input type="text" id="natsUrl" value="ws://localhost:8080" placeholder="ws://host:port">
+        </label>
+        <label>
+            Subject Pattern:
+            <input type="text" id="subjectPattern" value="stream.>" placeholder="stream.>">
+        </label>
+        <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+        <button onclick="clearLogs()">Clear Logs</button>
+    </div>
+
+    <div class="main-container" id="streamsContainer">
+        <div class="no-streams">
+            <p>No active streams. Connect to NATS and wait for stream data.</p>
+        </div>
+    </div>
+
+    <div class="logs" id="logsContainer"></div>
+
+    <!-- NATS WebSocket Client -->
+    <script src="https://cdn.jsdelivr.net/npm/nats.ws@1.19.1/nats.min.js"></script>
+
+    <script>
+        // State
+        let nc = null;  // NATS connection
+        let subscription = null;
+        const streams = new Map();  // stream_id -> { canvas, ctx, stats }
+
+        // DOM Elements
+        const statusDot = document.getElementById('statusDot');
+        const statusText = document.getElementById('statusText');
+        const connectBtn = document.getElementById('connectBtn');
+        const streamsContainer = document.getElementById('streamsContainer');
+        const logsContainer = document.getElementById('logsContainer');
+
+        // Colors for bounding boxes (class-based)
+        const BBOX_COLORS = [
+            '#e94560', '#51cf66', '#339af0', '#ffd43b', '#ff922b',
+            '#cc5de8', '#20c997', '#ff8787', '#748ffc', '#69db7c'
+        ];
+
+        function log(message, type = 'info') {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logsContainer.insertBefore(entry, logsContainer.firstChild);
+
+            // Keep only last 100 logs
+            while (logsContainer.children.length > 100) {
+                logsContainer.removeChild(logsContainer.lastChild);
+            }
+        }
+
+        function clearLogs() {
+            logsContainer.innerHTML = '';
+        }
+
+        function setConnectionStatus(connected) {
+            if (connected) {
+                statusDot.classList.add('connected');
+                statusText.textContent = 'Connected';
+                connectBtn.textContent = 'Disconnect';
+            } else {
+                statusDot.classList.remove('connected');
+                statusText.textContent = 'Disconnected';
+                connectBtn.textContent = 'Connect';
+            }
+        }
+
+        async function toggleConnection() {
+            if (nc) {
+                await disconnect();
+            } else {
+                await connect();
+            }
+        }
+
+        async function connect() {
+            const url = document.getElementById('natsUrl').value;
+            const subject = document.getElementById('subjectPattern').value;
+
+            log(`Connecting to ${url}...`);
+            connectBtn.disabled = true;
+
+            try {
+                // Connect to NATS
+                nc = await nats.connect({
+                    servers: url,
+                    reconnect: true,
+                    maxReconnectAttempts: -1,
+                    reconnectTimeWait: 2000,
+                });
+
+                log(`Connected to NATS at ${url}`, 'info');
+                setConnectionStatus(true);
+
+                // Subscribe to subject pattern
+                subscription = nc.subscribe(subject);
+                log(`Subscribed to: ${subject}`, 'info');
+
+                // Process messages
+                processMessages();
+
+                // Handle connection events
+                (async () => {
+                    for await (const s of nc.status()) {
+                        switch (s.type) {
+                            case 'disconnect':
+                                log('Disconnected from NATS', 'warn');
+                                setConnectionStatus(false);
+                                break;
+                            case 'reconnect':
+                                log('Reconnected to NATS', 'info');
+                                setConnectionStatus(true);
+                                break;
+                            case 'error':
+                                log(`NATS error: ${s.data}`, 'error');
+                                break;
+                        }
+                    }
+                })();
+
+            } catch (err) {
+                log(`Connection failed: ${err.message}`, 'error');
+                nc = null;
+            }
+
+            connectBtn.disabled = false;
+        }
+
+        async function disconnect() {
+            if (subscription) {
+                subscription.unsubscribe();
+                subscription = null;
+            }
+
+            if (nc) {
+                await nc.close();
+                nc = null;
+            }
+
+            setConnectionStatus(false);
+            log('Disconnected');
+
+            // Clear streams
+            streams.clear();
+            streamsContainer.innerHTML = '<div class="no-streams"><p>No active streams.</p></div>';
+        }
+
+        async function processMessages() {
+            for await (const msg of subscription) {
+                try {
+                    const data = JSON.parse(new TextDecoder().decode(msg.data));
+                    handleStreamData(data);
+                } catch (err) {
+                    log(`Failed to parse message: ${err.message}`, 'error');
+                }
+            }
+        }
+
+        function handleStreamData(data) {
+            const { stream_id, timestamp, frame_number, fps, width, height, detections, image } = data;
+
+            // Get or create stream view
+            let streamView = streams.get(stream_id);
+            if (!streamView) {
+                streamView = createStreamView(stream_id);
+                streams.set(stream_id, streamView);
+
+                // Remove "no streams" message
+                const noStreams = streamsContainer.querySelector('.no-streams');
+                if (noStreams) noStreams.remove();
+            }
+
+            // Update stats
+            streamView.statsEl.textContent = `FPS: ${fps?.toFixed(1) || 0} | Frame: ${frame_number || 0}`;
+
+            // Draw image if available
+            if (image) {
+                drawFrame(streamView, image, width, height, detections || []);
+            }
+
+            // Update detection list
+            updateDetectionList(streamView, detections || []);
+        }
+
+        function createStreamView(streamId) {
+            const card = document.createElement('div');
+            card.className = 'stream-card';
+            card.innerHTML = `
+                <div class="stream-header">
+                    <span class="stream-title">${streamId}</span>
+                    <span class="stream-stats">FPS: 0 | Frame: 0</span>
+                </div>
+                <div class="stream-canvas-container">
+                    <canvas class="stream-canvas" width="640" height="360"></canvas>
+                    <div class="detection-overlay"></div>
+                </div>
+            `;
+
+            streamsContainer.appendChild(card);
+
+            const canvas = card.querySelector('canvas');
+            const ctx = canvas.getContext('2d');
+            const statsEl = card.querySelector('.stream-stats');
+            const detectionOverlay = card.querySelector('.detection-overlay');
+
+            return {
+                card,
+                canvas,
+                ctx,
+                statsEl,
+                detectionOverlay,
+                image: new Image()
+            };
+        }
+
+        function drawFrame(streamView, base64Image, width, height, detections) {
+            const { canvas, ctx, image } = streamView;
+
+            // Update canvas size if needed
+            if (canvas.width !== width || canvas.height !== height) {
+                canvas.width = width || 640;
+                canvas.height = height || 360;
+            }
+
+            // Load and draw image
+            image.onload = () => {
+                // Draw frame
+                ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+
+                // Draw bounding boxes
+                detections.forEach((det, idx) => {
+                    drawBoundingBox(ctx, det, idx);
+                });
+            };
+
+            image.src = `data:image/jpeg;base64,${base64Image}`;
+        }
+
+        function drawBoundingBox(ctx, detection, colorIdx) {
+            const { bbox, class: className, confidence } = detection;
+            if (!bbox) return;
+
+            const color = BBOX_COLORS[colorIdx % BBOX_COLORS.length];
+
+            // Draw rectangle
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 2;
+            ctx.strokeRect(bbox.x, bbox.y, bbox.width, bbox.height);
+
+            // Draw label background
+            const label = `${className} ${(confidence * 100).toFixed(0)}%`;
+            ctx.font = '14px Arial';
+            const textWidth = ctx.measureText(label).width;
+            const textHeight = 18;
+
+            ctx.fillStyle = color;
+            ctx.fillRect(bbox.x, bbox.y - textHeight, textWidth + 8, textHeight);
+
+            // Draw label text
+            ctx.fillStyle = '#fff';
+            ctx.fillText(label, bbox.x + 4, bbox.y - 4);
+        }
+
+        function updateDetectionList(streamView, detections) {
+            const overlay = streamView.detectionOverlay;
+
+            if (detections.length === 0) {
+                overlay.innerHTML = '<div style="color:#666">No detections</div>';
+                return;
+            }
+
+            overlay.innerHTML = detections.map((det, idx) => {
+                const color = BBOX_COLORS[idx % BBOX_COLORS.length];
+                return `<div class="detection-item" style="border-left: 3px solid ${color}">
+                    ${det.class}: ${(det.confidence * 100).toFixed(1)}%
+                </div>`;
+            }).join('');
+        }
+
+        // Auto-reconnect on page visibility
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible' && !nc) {
+                // Optionally auto-reconnect
+            }
+        });
+
+        log('Ready. Enter NATS WebSocket URL and click Connect.', 'info');
+    </script>
+</body>
+</html>
