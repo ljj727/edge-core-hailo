@@ -149,6 +149,7 @@ set(CORE_SOURCES
     src/model_registry.cpp
     src/nats_publisher.cpp
     src/hailo_inference.cpp
+    src/batch_inference_manager.cpp
     src/event_compositor.cpp
     src/stream_processor.cpp
     src/stream_manager.cpp

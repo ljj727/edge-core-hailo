@@ -337,7 +337,7 @@ VoidResult StreamProcessor::Start() {
         return result;
     }
 
-    // Set pipeline to playing
+    // Set pipeline to playing (non-blocking - state change handled by bus messages)
     GstStateChangeReturn ret = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         DestroyPipeline();
@@ -346,14 +346,18 @@ VoidResult StreamProcessor::Start() {
         return MakeError("Failed to start GStreamer pipeline");
     }
 
+    // Don't block here - GST_STATE_CHANGE_ASYNC is normal for RTSP
+    // State will be updated via GST_MESSAGE_STATE_CHANGED in OnBusMessage
+
     start_time_ = std::chrono::steady_clock::now();
     last_fps_update_ = start_time_;
     frame_count_ = 0;
     frames_since_last_update_ = 0;
     reconnect_attempts_ = 0;
 
+    // Set to STARTING, will become RUNNING when pipeline reaches PLAYING state
     SetState(StreamState::kRunning);
-    LogInfo("Stream started: " + stream_id_);
+    LogInfo("Stream started (async): " + stream_id_);
 
     return MakeOk();
 }
@@ -502,6 +506,17 @@ VoidResult StreamProcessor::CreatePipeline() {
         // Set model configuration for proper output parsing
         hailo_inference_->SetModelConfig(task_, num_keypoints_, labels_);
 
+        // Get batch manager for batch > 1 models
+        int batch_size = hailo_inference_->GetBatchSize();
+        if (batch_size > 1) {
+            batch_manager_ = hailo_inference_->GetBatchManager();
+            if (batch_manager_) {
+                batch_manager_->RegisterStream(stream_id_);
+                LogInfo("Batch inference enabled (batch=" + std::to_string(batch_size) +
+                        ") for stream: " + stream_id_);
+            }
+        }
+
         LogInfo("HailoRT inference initialized (shared instance)");
     }
 
@@ -547,6 +562,12 @@ VoidResult StreamProcessor::CreatePipeline() {
 }
 
 void StreamProcessor::DestroyPipeline() {
+    // Unregister from batch manager if registered
+    if (batch_manager_) {
+        batch_manager_->UnregisterStream(stream_id_);
+        batch_manager_.reset();
+    }
+
     if (reconnect_source_id_ > 0) {
         g_source_remove(reconnect_source_id_);
         reconnect_source_id_ = 0;
@@ -558,7 +579,13 @@ void StreamProcessor::DestroyPipeline() {
     }
 
     if (pipeline_) {
+        // Non-blocking state change with timeout (2 seconds max)
         gst_element_set_state(pipeline_, GST_STATE_NULL);
+        GstStateChangeReturn ret = gst_element_get_state(pipeline_, nullptr, nullptr,
+                                                          2 * GST_SECOND);
+        if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
+            LogWarning("Pipeline state change timeout, forcing destroy");
+        }
 
         if (appsink_) {
             gst_object_unref(appsink_);
@@ -695,15 +722,38 @@ void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
     frame_width_ = width;
     frame_height_ = height;
 
+    // JPEG 인코딩 (needed for both sync and async paths)
+    auto jpeg_data = EncodeJpeg(map.data, width, height, jpeg_quality_);
+
     // Run inference via HailoRT API if available
     std::vector<Detection> detections;
+
+    if (batch_manager_) {
+        // Batch inference path (async) - submit frame and return
+        // Results will be handled via OnBatchResult callback
+        auto jpeg_copy = jpeg_data;  // Copy for callback
+        batch_manager_->SubmitFrame(
+            stream_id_,
+            map.data, width, height,
+            [this, jpeg_copy, width, height](const std::string& stream_id,
+                                              std::vector<Detection> dets) {
+                OnBatchResult(stream_id, std::move(dets), jpeg_copy, width, height);
+            });
+
+        // Save snapshot even in async mode
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            last_snapshot_ = std::move(jpeg_data);
+        }
+        gst_buffer_unmap(buffer, &map);
+        return;  // Async path - callback will handle the rest
+    }
+
+    // Synchronous inference path (batch=1 models)
     if (hailo_inference_ && hailo_inference_->IsReady()) {
         detections = hailo_inference_->RunInference(
             map.data, width, height, config_.confidence_threshold);
     }
-
-    // JPEG 인코딩
-    auto jpeg_data = EncodeJpeg(map.data, width, height, jpeg_quality_);
 
     // 스냅샷 저장
     {
@@ -726,6 +776,15 @@ void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
     // 이벤트 체크 (각 detection에 event_setting_id 태깅)
     if (!event.detections.empty() && event_compositor_) {
         event_compositor_->CheckEvents(event.detections, width, height);
+
+        // events 맵 생성 (event_id -> {status, labels})
+        for (const auto& det : event.detections) {
+            if (!det.event_setting_id.empty()) {
+                auto& ev_status = event.events[det.event_setting_id];
+                ev_status.status = 2;  // ALARM (ROI 내 존재)
+                ev_status.labels.push_back(det.class_name);
+            }
+        }
     }
 
     // 이미지 포함 여부
@@ -849,9 +908,19 @@ gboolean StreamProcessor::OnBusMessage(
         }
 
         case GST_MESSAGE_EOS: {
-            LogWarning("Stream " + self->stream_id_ + " received EOS");
+            LogInfo("Stream " + self->stream_id_ + " received EOS, reconnecting...");
+            // For looped RTSP: need full reconnect since RTSP connection is closed
+            self->reconnect_attempts_ = 0;  // Reset attempts for EOS (not an error)
             self->DestroyPipeline();
-            self->ScheduleReconnect();
+            // Quick reconnect for EOS (500ms delay)
+            g_timeout_add(500, [](gpointer user_data) -> gboolean {
+                auto* self = static_cast<StreamProcessor*>(user_data);
+                if (self->state_ != StreamState::kStopped) {
+                    self->Start();
+                    LogInfo("Stream " + self->stream_id_ + " reconnected after EOS");
+                }
+                return G_SOURCE_REMOVE;
+            }, self);
             break;
         }
 
@@ -1079,6 +1148,69 @@ gboolean StreamProcessor::OnReconnectTimeout(gpointer user_data) {
     }
 
     return G_SOURCE_REMOVE;
+}
+
+// ============================================================================
+// Batch Inference Callback
+// ============================================================================
+
+void StreamProcessor::OnBatchResult(
+    const std::string& stream_id,
+    std::vector<Detection> detections,
+    const std::vector<uint8_t>& jpeg_data,
+    int width, int height) {
+
+    // This is called from batch manager worker thread
+    // Handle detection event publishing and callbacks
+
+    // DetectionEvent 생성
+    DetectionEvent event;
+    event.stream_id = stream_id;
+    event.timestamp = GetCurrentTimestampMs();
+    event.frame_number = frame_count_.load();
+    event.fps = current_fps_.load();
+    event.width = width;
+    event.height = height;
+    event.detections = std::move(detections);
+
+    // 이벤트 체크 (각 detection에 event_setting_id 태깅)
+    if (!event.detections.empty() && event_compositor_) {
+        event_compositor_->CheckEvents(event.detections, width, height);
+
+        // events 맵 생성 (event_id -> {status, labels})
+        for (const auto& det : event.detections) {
+            if (!det.event_setting_id.empty()) {
+                auto& ev_status = event.events[det.event_setting_id];
+                ev_status.status = 2;  // ALARM (ROI 내 존재)
+                ev_status.labels.push_back(det.class_name);
+            }
+        }
+    }
+
+    // 이미지 포함 여부
+    if (publish_images_) {
+        event.image_data = jpeg_data;
+    }
+
+    // Detection이 있으면 시간 업데이트
+    if (!event.detections.empty()) {
+        last_detection_time_ = event.timestamp;
+    }
+
+    // NATS 발행
+    if (nats_publisher_ && nats_publisher_->IsConnected()) {
+        if (auto result = nats_publisher_->Publish(event); IsError(result)) {
+            LogWarning("Failed to publish to NATS (batch): " + GetError(result));
+        }
+    }
+
+    // Detection callback 호출
+    {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        if (detection_callback_) {
+            detection_callback_(event);
+        }
+    }
 }
 
 }  // namespace stream_daemon

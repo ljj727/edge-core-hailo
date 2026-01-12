@@ -71,6 +71,11 @@ void ToProto(const ModelInfo& info, autocare::Model* proto) {
             out_proto->add_classifiers(classifier);
         }
     }
+
+    // Add labels (단순 라벨 목록)
+    for (const auto& output : info.outputs) {
+        proto->add_labels(output.label);
+    }
 }
 
 // App → Proto 변환 (App = 단일 Model wrapper)

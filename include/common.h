@@ -8,6 +8,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -116,6 +117,12 @@ struct StreamStatus {
     int64_t last_detection_time{0};
 };
 
+// 이벤트 상태 (0=SAFE/NONE, 1=WARNING, 2=DANGER/ALARM)
+struct EventStatus {
+    int status{0};
+    std::vector<std::string> labels;   // 해당 이벤트에 걸린 라벨들
+};
+
 struct DetectionEvent {
     std::string stream_id;
     int64_t timestamp{0};              // Unix timestamp in milliseconds
@@ -123,7 +130,8 @@ struct DetectionEvent {
     double fps{0.0};
     int width{0};                      // Frame width
     int height{0};                     // Frame height
-    std::vector<Detection> detections; // 각 detection에 event_setting_id 포함
+    std::vector<Detection> detections; // 객체 정보
+    std::unordered_map<std::string, EventStatus> events;  // event_id -> status
     std::vector<uint8_t> image_data;   // JPEG encoded frame (optional)
 };
 

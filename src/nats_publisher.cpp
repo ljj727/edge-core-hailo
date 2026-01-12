@@ -469,7 +469,7 @@ std::string NatsPublisher::SerializeToJson(const DetectionEvent& event) const {
     j["width"] = event.width;
     j["height"] = event.height;
 
-    // Detections array (각 detection에 event 정보 포함)
+    // Detections array (객체 정보만, event 제외)
     json detections_array = json::array();
     for (const auto& det : event.detections) {
         json det_obj;
@@ -482,12 +482,6 @@ std::string NatsPublisher::SerializeToJson(const DetectionEvent& event) const {
             {"width", det.bbox.width},
             {"height", det.bbox.height}
         };
-        // 이 객체가 발생시킨 이벤트 (없으면 null)
-        if (!det.event_setting_id.empty()) {
-            det_obj["event"] = det.event_setting_id;
-        } else {
-            det_obj["event"] = nullptr;
-        }
 
         // Keypoints (pose model only)
         if (!det.keypoints.empty()) {
@@ -501,6 +495,16 @@ std::string NatsPublisher::SerializeToJson(const DetectionEvent& event) const {
         detections_array.push_back(std::move(det_obj));
     }
     j["detections"] = std::move(detections_array);
+
+    // Events object (이벤트별 status와 labels)
+    json events_obj = json::object();
+    for (const auto& [event_id, status] : event.events) {
+        json ev_obj;
+        ev_obj["status"] = status.status;
+        ev_obj["labels"] = status.labels;
+        events_obj[event_id] = std::move(ev_obj);
+    }
+    j["events"] = std::move(events_obj);
 
     // 이미지 데이터 (Base64 인코딩)
     if (!event.image_data.empty()) {

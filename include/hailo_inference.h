@@ -9,6 +9,11 @@
 #include <vector>
 #include <unordered_map>
 
+// Forward declaration
+namespace stream_daemon {
+class BatchInferenceManager;
+}
+
 namespace stream_daemon {
 
 /**
@@ -53,6 +58,16 @@ public:
     HailoInference& operator=(const HailoInference&) = delete;
 
     /**
+     * @brief Frame data for batch inference
+     */
+    struct FrameInput {
+        const uint8_t* rgb_data;
+        int width;
+        int height;
+        std::string stream_id;  // To map results back
+    };
+
+    /**
      * @brief Run inference on RGB frame and get detections
      * @param rgb_data RGB pixel data (width * height * 3 bytes)
      * @param width Frame width
@@ -67,6 +82,21 @@ public:
         float confidence_threshold = 0.25f);
 
     /**
+     * @brief Run batch inference on multiple frames
+     * @param frames Vector of frame inputs (up to batch_size)
+     * @param confidence_threshold Minimum confidence for detections
+     * @return Map of stream_id to detections
+     */
+    [[nodiscard]] std::unordered_map<std::string, std::vector<Detection>> RunBatchInference(
+        const std::vector<FrameInput>& frames,
+        float confidence_threshold = 0.25f);
+
+    /**
+     * @brief Get model batch size
+     */
+    int GetBatchSize() const { return batch_size_; }
+
+    /**
      * @brief Get model input dimensions
      */
     int GetInputWidth() const { return input_width_; }
@@ -76,6 +106,13 @@ public:
      * @brief Check if inference is ready
      */
     bool IsReady() const { return is_ready_; }
+
+    /**
+     * @brief Get or create BatchInferenceManager for this model
+     * Returns nullptr if batch_size == 1
+     * @param batch_timeout_ms Timeout for batch collection
+     */
+    std::shared_ptr<BatchInferenceManager> GetBatchManager(int batch_timeout_ms = 50);
 
     /**
      * @brief Set model configuration for proper output parsing
@@ -105,6 +142,21 @@ private:
                                            int frame_height,
                                            const LetterboxInfo& letterbox);
 
+    // Raw YOLO output parsing (for non-NMS models like best12.hef)
+    std::vector<Detection> ParseRawYoloOutput(
+        const std::vector<std::vector<uint8_t>>& output_buffers,
+        float confidence_threshold,
+        float iou_threshold,
+        int frame_width,
+        int frame_height,
+        const LetterboxInfo& letterbox);
+
+    // NMS helper
+    static std::vector<int> ApplyNMS(
+        const std::vector<std::array<float, 4>>& boxes,
+        const std::vector<float>& scores,
+        float iou_threshold);
+
     // Letterbox resize helper
     static LetterboxInfo LetterboxResize(const uint8_t* src, int src_w, int src_h,
                                           uint8_t* dst, int dst_w, int dst_h,
@@ -124,12 +176,14 @@ private:
     // Model info
     int input_width_{640};
     int input_height_{640};
+    int batch_size_{1};  // Batch size from HEF model
     size_t input_frame_size_{0};
 
     // NMS output info
     int num_classes_{80};
     int max_bboxes_per_class_{100};
     bool is_nms_output_{false};
+    bool is_raw_yolo_output_{false};  // For multi-output models without NMS (e.g., best12.hef)
 
     // Model config (set via SetModelConfig)
     std::string task_{"det"};           // "det" or "pose"
@@ -144,6 +198,10 @@ private:
     // State
     bool is_ready_{false};
     mutable std::mutex inference_mutex_;
+
+    // Batch manager (created on demand for batch > 1)
+    std::shared_ptr<BatchInferenceManager> batch_manager_;
+    std::mutex batch_manager_mutex_;
 };
 
 }  // namespace stream_daemon

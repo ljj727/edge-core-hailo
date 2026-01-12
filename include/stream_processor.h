@@ -4,6 +4,7 @@
 #include "common.h"
 #include "nats_publisher.h"
 #include "hailo_inference.h"
+#include "batch_inference_manager.h"
 #include "event_compositor.h"
 
 #include <gst/gst.h>
@@ -225,6 +226,15 @@ private:
     // HailoRT direct inference (when HEF is specified)
     // Shared instance for efficient multi-stream processing
     std::shared_ptr<HailoInference> hailo_inference_;
+
+    // Batch inference manager (for batch > 1 models)
+    std::shared_ptr<BatchInferenceManager> batch_manager_;
+
+    // Helper for batch inference callback
+    void OnBatchResult(const std::string& stream_id,
+                       std::vector<Detection> detections,
+                       const std::vector<uint8_t>& jpeg_data,
+                       int width, int height);
 
     // Event compositor (이벤트 설정 및 감지)
     std::unique_ptr<EventCompositor> event_compositor_;

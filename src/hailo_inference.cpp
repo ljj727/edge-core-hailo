@@ -1,9 +1,12 @@
 #include "hailo_inference.h"
+#include "batch_inference_manager.h"
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <map>
 #include <numeric>
+#include <sstream>
 #include <thread>
 
 namespace stream_daemon {
@@ -175,8 +178,21 @@ VoidResult HailoInference::Initialize(const std::string& hef_path) {
         const auto& input_info = (*input_vstream_infos)[0];
         input_height_ = input_info.shape.height;
         input_width_ = input_info.shape.width;
+
+        // Get batch size from network group (not from shape.features which is RGB channels)
+        // HailoRT stores batch info in the frame size - single frame size * batch = total
+        // For now, infer from model name or use a config
+        batch_size_ = 1;  // Default to 1
+
+        // Check if model name contains batch indicator
+        if (hef_path_.find("batch2") != std::string::npos) {
+            batch_size_ = 2;
+        } else if (hef_path_.find("batch4") != std::string::npos) {
+            batch_size_ = 4;
+        }
+
         LogInfo("Model input: " + std::to_string(input_width_) + "x" +
-                std::to_string(input_height_));
+                std::to_string(input_height_) + ", batch=" + std::to_string(batch_size_));
     }
 
     // Check output for NMS format
@@ -246,6 +262,10 @@ VoidResult HailoInference::Initialize(const std::string& hef_path) {
 
     if (output_vstreams_.size() > 1) {
         LogInfo("Multi-output model detected: " + std::to_string(output_vstreams_.size()) + " output vstreams");
+        // Multi-output models (like best12.hef) are raw YOLO outputs, not NMS
+        is_raw_yolo_output_ = true;
+        is_nms_output_ = false;
+        LogInfo("Using raw YOLO output parsing (multi-scale feature maps)");
     }
 
     // Note: Don't manually activate - the scheduler handles activation automatically
@@ -330,22 +350,19 @@ std::vector<Detection> HailoInference::RunInference(
         }
     }
 
-    // Parse output - use first buffer for NMS models, or combine for multi-output
+    // Parse output - use appropriate parser based on model type
     std::vector<Detection> detections;
-    if (is_nms_output_ && !output_buffers_.empty()) {
+    if (is_raw_yolo_output_ && !output_buffers_.empty()) {
+        // Multi-output model (like best12.hef) - use raw YOLO parsing
+        if (inference_count == 1) {
+            LogInfo("Using raw YOLO output parsing for " + std::to_string(output_vstreams_.size()) + " outputs");
+        }
+        detections = ParseRawYoloOutput(output_buffers_, confidence_threshold, 0.45f,
+                                         width, height, letterbox_info);
+    } else if (is_nms_output_ && !output_buffers_.empty()) {
         // Single NMS output - parse first vstream
         detections = ParseNmsOutput(output_buffers_[0], confidence_threshold,
                                      width, height, letterbox_info);
-    } else if (!output_buffers_.empty()) {
-        // Multi-output model (like best12.hef) - need raw YOLO parsing
-        // For now, just log that we received all outputs successfully
-        if (inference_count == 1) {
-            LogInfo("Non-NMS model: received " + std::to_string(output_vstreams_.size()) +
-                   " outputs, total bytes = " + std::to_string(
-                       std::accumulate(output_frame_sizes_.begin(), output_frame_sizes_.end(), 0UL)));
-        }
-        // TODO: Implement raw YOLO output parsing for multi-head models
-        // For now, return empty detections but at least don't timeout
     }
 
     if (inference_count == 1 || (inference_count % 100 == 0 && !detections.empty())) {
@@ -353,6 +370,127 @@ std::vector<Detection> HailoInference::RunInference(
     }
 
     return detections;
+}
+
+std::unordered_map<std::string, std::vector<Detection>> HailoInference::RunBatchInference(
+    const std::vector<FrameInput>& frames,
+    float confidence_threshold) {
+
+    static int batch_inference_count = 0;
+    std::unordered_map<std::string, std::vector<Detection>> results;
+
+    if (!is_ready_ || input_vstreams_.empty() || output_vstreams_.empty()) {
+        LogWarning("RunBatchInference: not ready");
+        return results;
+    }
+
+    if (frames.empty()) {
+        return results;
+    }
+
+    std::lock_guard<std::mutex> lock(inference_mutex_);
+    ++batch_inference_count;
+
+    const int num_frames = static_cast<int>(frames.size());
+    const int actual_batch = std::min(num_frames, batch_size_);
+
+    if (batch_inference_count == 1 || batch_inference_count % 100 == 0) {
+        LogInfo("RunBatchInference: batch #" + std::to_string(batch_inference_count) +
+                ", frames=" + std::to_string(num_frames) + "/" + std::to_string(batch_size_));
+    }
+
+    // Prepare batch input buffer (batch_size_ frames, each input_frame_size_ bytes)
+    const size_t single_frame_size = input_width_ * input_height_ * 3;
+    std::vector<uint8_t> batch_buffer(batch_size_ * single_frame_size, 114);  // Pad with gray
+    std::vector<LetterboxInfo> letterbox_infos(batch_size_);
+
+    // Process each frame in the batch
+    for (int i = 0; i < batch_size_; ++i) {
+        uint8_t* dst = batch_buffer.data() + i * single_frame_size;
+
+        if (i < num_frames) {
+            const auto& frame = frames[i];
+            if (frame.width != input_width_ || frame.height != input_height_) {
+                letterbox_infos[i] = LetterboxResize(frame.rgb_data, frame.width, frame.height,
+                                                      dst, input_width_, input_height_);
+            } else {
+                std::memcpy(dst, frame.rgb_data, single_frame_size);
+                letterbox_infos[i].scale = 1.0f;
+                letterbox_infos[i].pad_x = 0;
+                letterbox_infos[i].pad_y = 0;
+                letterbox_infos[i].new_w = frame.width;
+                letterbox_infos[i].new_h = frame.height;
+            }
+        }
+        // Else: already padded with gray (114)
+    }
+
+    // Write batch to input vstream
+    auto status = input_vstreams_[0].write(
+        hailort::MemoryView(batch_buffer.data(), batch_buffer.size()));
+    if (status != HAILO_SUCCESS) {
+        LogWarning("RunBatchInference: failed to write input: " + std::to_string(static_cast<int>(status)));
+        return results;
+    }
+
+    // Read from all output vstreams
+    for (size_t i = 0; i < output_vstreams_.size(); ++i) {
+        status = output_vstreams_[i].read(
+            hailort::MemoryView(output_buffers_[i].data(), output_buffers_[i].size()));
+        if (status != HAILO_SUCCESS) {
+            LogWarning("RunBatchInference: failed to read output[" + std::to_string(i) + "]");
+            return results;
+        }
+    }
+
+    // Parse outputs for each frame in batch
+    // For batch models, output buffers contain interleaved or sequential batch results
+    // We need to extract per-frame results
+
+    for (int i = 0; i < actual_batch && i < num_frames; ++i) {
+        const auto& frame = frames[i];
+        std::vector<Detection> detections;
+
+        if (is_raw_yolo_output_ && !output_buffers_.empty()) {
+            // For multi-output models, outputs are per-batch
+            // Each output buffer is: [batch, channels, height, width] flattened
+            // We need to extract the i-th batch slice
+
+            std::vector<std::vector<uint8_t>> frame_outputs(output_buffers_.size());
+            for (size_t out_idx = 0; out_idx < output_buffers_.size(); ++out_idx) {
+                size_t per_batch_size = output_buffers_[out_idx].size() / batch_size_;
+                frame_outputs[out_idx].resize(per_batch_size);
+                std::memcpy(frame_outputs[out_idx].data(),
+                           output_buffers_[out_idx].data() + i * per_batch_size,
+                           per_batch_size);
+            }
+
+            detections = ParseRawYoloOutput(frame_outputs, confidence_threshold, 0.45f,
+                                             frame.width, frame.height, letterbox_infos[i]);
+        } else if (is_nms_output_ && !output_buffers_.empty()) {
+            // For NMS output, extract per-batch slice
+            size_t per_batch_size = output_buffers_[0].size() / batch_size_;
+            std::vector<uint8_t> frame_output(per_batch_size);
+            std::memcpy(frame_output.data(),
+                       output_buffers_[0].data() + i * per_batch_size,
+                       per_batch_size);
+
+            detections = ParseNmsOutput(frame_output, confidence_threshold,
+                                         frame.width, frame.height, letterbox_infos[i]);
+        }
+
+        results[frame.stream_id] = std::move(detections);
+    }
+
+    if (batch_inference_count == 1 || batch_inference_count % 100 == 0) {
+        size_t total_detections = 0;
+        for (const auto& [id, dets] : results) {
+            total_detections += dets.size();
+        }
+        LogInfo("RunBatchInference: found " + std::to_string(total_detections) + " total detections");
+    }
+
+    return results;
 }
 
 std::vector<Detection> HailoInference::ParseNmsOutput(
@@ -486,8 +624,384 @@ std::vector<Detection> HailoInference::ParseNmsOutput(
             }
 
             if (det.bbox.width > 0 && det.bbox.height > 0) {
+                // Debug: log first few detections with coordinates
+                static int det_log_count = 0;
+                if (det_log_count < 5) {
+                    std::ostringstream oss;
+                    oss << "Detection[" << det_log_count << "]: class_id=" << det.class_id
+                        << " (" << det.class_name << ") conf=" << det.confidence
+                        << " bbox=(" << det.bbox.x << "," << det.bbox.y
+                        << "," << det.bbox.width << "," << det.bbox.height << ")"
+                        << " frame=" << frame_width << "x" << frame_height
+                        << " (labels_size=" << labels_.size() << ")";
+                    LogInfo(oss.str());
+                    ++det_log_count;
+                }
                 detections.push_back(det);
             }
+        }
+    }
+
+    return detections;
+}
+
+// ============================================================================
+// Raw YOLO Output Parsing (for multi-output models like best12.hef)
+// ============================================================================
+
+std::vector<int> HailoInference::ApplyNMS(
+    const std::vector<std::array<float, 4>>& boxes,
+    const std::vector<float>& scores,
+    float iou_threshold) {
+
+    // Sort by score (descending)
+    std::vector<int> indices(scores.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(indices.begin(), indices.end(), [&scores](int a, int b) {
+        return scores[a] > scores[b];
+    });
+
+    std::vector<int> keep;
+    std::vector<bool> suppressed(scores.size(), false);
+
+    for (int idx : indices) {
+        if (suppressed[idx]) continue;
+        keep.push_back(idx);
+
+        const auto& box_i = boxes[idx];
+        float area_i = (box_i[2] - box_i[0]) * (box_i[3] - box_i[1]);
+
+        for (size_t j = 0; j < indices.size(); ++j) {
+            int jdx = indices[j];
+            if (suppressed[jdx] || jdx == idx) continue;
+
+            const auto& box_j = boxes[jdx];
+
+            // Calculate IoU
+            float x1 = std::max(box_i[0], box_j[0]);
+            float y1 = std::max(box_i[1], box_j[1]);
+            float x2 = std::min(box_i[2], box_j[2]);
+            float y2 = std::min(box_i[3], box_j[3]);
+
+            float inter_w = std::max(0.0f, x2 - x1);
+            float inter_h = std::max(0.0f, y2 - y1);
+            float inter_area = inter_w * inter_h;
+
+            float area_j = (box_j[2] - box_j[0]) * (box_j[3] - box_j[1]);
+            float union_area = area_i + area_j - inter_area;
+            float iou = (union_area > 0) ? inter_area / union_area : 0.0f;
+
+            if (iou > iou_threshold) {
+                suppressed[jdx] = true;
+            }
+        }
+    }
+
+    return keep;
+}
+
+std::vector<Detection> HailoInference::ParseRawYoloOutput(
+    const std::vector<std::vector<uint8_t>>& output_buffers,
+    float confidence_threshold,
+    float iou_threshold,
+    int frame_width,
+    int frame_height,
+    const LetterboxInfo& letterbox) {
+
+    std::vector<Detection> detections;
+
+    if (output_buffers.empty()) {
+        return detections;
+    }
+
+    // Model parameters - use SetModelConfig values or defaults
+    const int model_num_keypoints = (num_keypoints_ > 0) ? num_keypoints_ : 4;
+    const int reg_max = 16;  // DFL bins
+
+    // Debug output structure
+    static int debug_count = 0;
+    if (debug_count < 3) {
+        std::ostringstream oss;
+        oss << "RawYOLO Parse: " << output_buffers.size() << " outputs, ";
+        oss << "keypoints=" << model_num_keypoints;
+        LogInfo(oss.str());
+
+        for (size_t i = 0; i < output_buffers.size(); ++i) {
+            size_t num_floats = output_buffers[i].size() / sizeof(float);
+            LogInfo("  Output[" + std::to_string(i) + "]: " + std::to_string(num_floats) + " floats (" +
+                    output_vstreams_[i].name() + ")");
+        }
+        ++debug_count;
+    }
+
+    // NEW 9-output model structure (multi-scale with full detection heads):
+    // P3 (120×120, stride 8):
+    //   - conv43: 120×120×64 = 921600 floats (DFL)
+    //   - conv44: 120×120×13 = 187200 floats (class)
+    //   - conv45: 120×120×12 = 172800 floats (keypoints)
+    // P4 (60×60, stride 16):
+    //   - conv57: 60×60×64 = 230400 floats (DFL)
+    //   - conv58: 60×60×13 = 46800 floats (class)
+    //   - conv59: 60×60×12 = 43200 floats (keypoints)
+    // P5 (30×30, stride 32):
+    //   - conv70: 30×30×64 = 57600 floats (DFL)
+    //   - conv71: 30×30×13 = 11700 floats (class)
+    //   - conv72: 30×30×12 = 10800 floats (keypoints)
+
+    // Scale configuration
+    struct ScaleInfo {
+        int grid_h;
+        int grid_w;
+        int stride;
+        int dfl_idx;      // Index of DFL output (64 channels)
+        int class_idx;    // Index of class output (13 channels)
+        int kp_idx;       // Index of keypoint output (12 channels)
+        int num_classes;  // Number of class channels
+    };
+
+    std::vector<ScaleInfo> scales;
+
+    // Map outputs by size to scales
+    int p3_dfl = -1, p3_class = -1, p3_kp = -1;
+    int p4_dfl = -1, p4_class = -1, p4_kp = -1;
+    int p5_dfl = -1, p5_class = -1, p5_kp = -1;
+
+    for (size_t i = 0; i < output_buffers.size(); ++i) {
+        size_t num_floats = output_buffers[i].size() / sizeof(float);
+
+        // P3 (120×120)
+        if (num_floats == 120*120*64) p3_dfl = i;
+        else if (num_floats == 120*120*13) p3_class = i;
+        else if (num_floats == 120*120*12) p3_kp = i;
+        // P4 (60×60)
+        else if (num_floats == 60*60*64) p4_dfl = i;
+        else if (num_floats == 60*60*13) p4_class = i;
+        else if (num_floats == 60*60*12) p4_kp = i;
+        // P5 (30×30)
+        else if (num_floats == 30*30*64) p5_dfl = i;
+        else if (num_floats == 30*30*13) p5_class = i;
+        else if (num_floats == 30*30*12) p5_kp = i;
+    }
+
+    // Build scale configs for available scales
+    if (p3_dfl >= 0 && p3_class >= 0) {
+        scales.push_back({120, 120, 8, p3_dfl, p3_class, p3_kp, 13});
+    }
+    if (p4_dfl >= 0 && p4_class >= 0) {
+        scales.push_back({60, 60, 16, p4_dfl, p4_class, p4_kp, 13});
+    }
+    if (p5_dfl >= 0 && p5_class >= 0) {
+        scales.push_back({30, 30, 32, p5_dfl, p5_class, p5_kp, 13});
+    }
+
+    if (debug_count == 1) {
+        LogInfo("  P3 outputs: dfl=" + std::to_string(p3_dfl) + " class=" + std::to_string(p3_class) + " kp=" + std::to_string(p3_kp));
+        LogInfo("  P4 outputs: dfl=" + std::to_string(p4_dfl) + " class=" + std::to_string(p4_class) + " kp=" + std::to_string(p4_kp));
+        LogInfo("  P5 outputs: dfl=" + std::to_string(p5_dfl) + " class=" + std::to_string(p5_class) + " kp=" + std::to_string(p5_kp));
+        LogInfo("  Active scales: " + std::to_string(scales.size()));
+    }
+
+    if (scales.empty()) {
+        LogWarning("No valid detection scales found in outputs");
+        return detections;
+    }
+
+    // DFL decode helper lambda - sequential layout [L0..L15, T0..T15, R0..R15, B0..B15]
+    auto decode_dfl = [reg_max](const float* values, int edge_idx) -> float {
+        const float* edge_values = values + edge_idx * reg_max;
+
+        float max_val = edge_values[0];
+        for (int i = 1; i < reg_max; ++i) {
+            if (edge_values[i] > max_val) max_val = edge_values[i];
+        }
+
+        // Softmax-like weighted sum
+        float weighted_sum = 0.0f;
+        float total_weight = 0.0f;
+
+        for (int i = 0; i < reg_max; ++i) {
+            float weight = std::exp((edge_values[i] - max_val) * 5.0f);
+            weighted_sum += weight * i;
+            total_weight += weight;
+        }
+
+        return weighted_sum / total_weight;
+    };
+
+    // Collect all detections from all scales
+    std::vector<std::array<float, 4>> all_boxes;
+    std::vector<float> all_scores;
+    std::vector<int> all_class_ids;
+    std::vector<std::vector<std::array<float, 3>>> all_keypoints;
+
+    // Process each scale
+    for (const auto& scale : scales) {
+        const float* dfl_data = reinterpret_cast<const float*>(output_buffers[scale.dfl_idx].data());
+        const float* class_data = reinterpret_cast<const float*>(output_buffers[scale.class_idx].data());
+        const float* kp_data = (scale.kp_idx >= 0) ?
+            reinterpret_cast<const float*>(output_buffers[scale.kp_idx].data()) : nullptr;
+
+        for (int gy = 0; gy < scale.grid_h; ++gy) {
+            for (int gx = 0; gx < scale.grid_w; ++gx) {
+                int pixel_idx = gy * scale.grid_w + gx;
+                int dfl_base = pixel_idx * 64;
+                int class_base = pixel_idx * scale.num_classes;
+
+                // Find best class score
+                float max_class_score = 0.0f;
+                int best_class_id = 0;
+
+                for (int c = 0; c < scale.num_classes; ++c) {
+                    float raw_score = class_data[class_base + c];
+                    float class_score = raw_score;
+
+                    // Apply sigmoid if values look like logits
+                    if (raw_score < -10.0f || raw_score > 10.0f ||
+                        raw_score < 0.0f || raw_score > 1.0f) {
+                        class_score = 1.0f / (1.0f + std::exp(-raw_score));
+                    }
+
+                    if (class_score > max_class_score) {
+                        max_class_score = class_score;
+                        best_class_id = c;
+                    }
+                }
+
+                // Skip low confidence
+                if (max_class_score < confidence_threshold) continue;
+
+                // Decode bbox using DFL
+                float dist_left = decode_dfl(&dfl_data[dfl_base], 0);
+                float dist_top = decode_dfl(&dfl_data[dfl_base], 1);
+                float dist_right = decode_dfl(&dfl_data[dfl_base], 2);
+                float dist_bottom = decode_dfl(&dfl_data[dfl_base], 3);
+
+                // Convert to pixel coordinates
+                float anchor_x = (gx + 0.5f) * scale.stride;
+                float anchor_y = (gy + 0.5f) * scale.stride;
+
+                float x1 = anchor_x - dist_left * scale.stride;
+                float y1 = anchor_y - dist_top * scale.stride;
+                float x2 = anchor_x + dist_right * scale.stride;
+                float y2 = anchor_y + dist_bottom * scale.stride;
+
+                // Skip invalid boxes
+                if (x2 <= 0 || y2 <= 0 || x1 >= input_width_ || y1 >= input_height_) continue;
+                if (x2 - x1 <= 0 || y2 - y1 <= 0) continue;
+
+                all_boxes.push_back({x1, y1, x2, y2});
+                all_scores.push_back(max_class_score);
+                all_class_ids.push_back(best_class_id);
+
+                // Parse keypoints
+                std::vector<std::array<float, 3>> kpts;
+                if (kp_data != nullptr) {
+                    int kp_base = pixel_idx * 12;
+
+                    for (int k = 0; k < model_num_keypoints; ++k) {
+                        // Sequential layout: [x0,y0,c0, x1,y1,c1, x2,y2,c2, x3,y3,c3]
+                        float kp_x_raw = kp_data[kp_base + k * 3 + 0];
+                        float kp_y_raw = kp_data[kp_base + k * 3 + 1];
+                        float kp_vis = kp_data[kp_base + k * 3 + 2];
+
+                        // Apply sigmoid to visibility (raw is logit)
+                        if (kp_vis < 0.0f || kp_vis > 1.0f) {
+                            kp_vis = 1.0f / (1.0f + std::exp(-kp_vis));
+                        }
+
+                        // YOLOv8-pose keypoint decoding:
+                        // kp = (grid_cell + raw_offset * 2) * stride
+                        float kp_x = (gx + kp_x_raw * 2.0f) * scale.stride;
+                        float kp_y = (gy + kp_y_raw * 2.0f) * scale.stride;
+
+                        kpts.push_back({kp_x, kp_y, kp_vis});
+                    }
+                }
+                all_keypoints.push_back(kpts);
+            }
+        }
+    }
+
+    if (debug_count == 1) {
+        LogInfo("  Pre-NMS detections: " + std::to_string(all_boxes.size()));
+    }
+
+    // Apply NMS
+    std::vector<int> keep_indices = ApplyNMS(all_boxes, all_scores, iou_threshold);
+
+    // Convert to Detection objects and transform coordinates
+    for (int idx : keep_indices) {
+        const auto& box = all_boxes[idx];
+
+        // Transform from model coords to original frame coords
+        float x1_orig = (box[0] - letterbox.pad_x) / letterbox.scale;
+        float y1_orig = (box[1] - letterbox.pad_y) / letterbox.scale;
+        float x2_orig = (box[2] - letterbox.pad_x) / letterbox.scale;
+        float y2_orig = (box[3] - letterbox.pad_y) / letterbox.scale;
+
+        // Clamp all coordinates to frame bounds FIRST, then calculate width/height
+        float x1_clamped = std::max(0.0f, std::min(static_cast<float>(frame_width), x1_orig));
+        float y1_clamped = std::max(0.0f, std::min(static_cast<float>(frame_height), y1_orig));
+        float x2_clamped = std::max(0.0f, std::min(static_cast<float>(frame_width), x2_orig));
+        float y2_clamped = std::max(0.0f, std::min(static_cast<float>(frame_height), y2_orig));
+
+        Detection det;
+        det.class_id = all_class_ids[idx];
+
+        // Set class name
+        if (!labels_.empty() && det.class_id < static_cast<int>(labels_.size())) {
+            det.class_name = labels_[det.class_id];
+        } else if (det.class_id < NUM_COCO_LABELS) {
+            det.class_name = COCO_LABELS[det.class_id];
+        } else {
+            det.class_name = "object";
+        }
+
+        det.confidence = all_scores[idx];
+        det.bbox.x = static_cast<int>(x1_clamped);
+        det.bbox.y = static_cast<int>(y1_clamped);
+        det.bbox.width = static_cast<int>(x2_clamped - x1_clamped);
+        det.bbox.height = static_cast<int>(y2_clamped - y1_clamped);
+
+        // Transform keypoints from model coords to original frame coords
+        if (!all_keypoints[idx].empty()) {
+            for (const auto& kp : all_keypoints[idx]) {
+                // kp[0], kp[1] are in model input pixel coords (0-960)
+                // Transform: remove letterbox padding, then scale to original frame
+                float kp_x_orig = (kp[0] - letterbox.pad_x) / letterbox.scale;
+                float kp_y_orig = (kp[1] - letterbox.pad_y) / letterbox.scale;
+
+                // Clip to frame bounds
+                kp_x_orig = std::max(0.0f, std::min(kp_x_orig, static_cast<float>(frame_width - 1)));
+                kp_y_orig = std::max(0.0f, std::min(kp_y_orig, static_cast<float>(frame_height - 1)));
+
+                Keypoint keypoint;
+                keypoint.x = kp_x_orig;  // Pixel coordinates
+                keypoint.y = kp_y_orig;
+                keypoint.visible = kp[2];
+                det.keypoints.push_back(keypoint);
+            }
+        }
+
+        if (det.bbox.width > 0 && det.bbox.height > 0) {
+            // Debug: log General class OR first 3 detections
+            static int det_log_count = 0;
+            static int general_log_count = 0;
+            bool should_log = (det_log_count < 3) || (det.class_name == "General" && general_log_count < 3);
+            if (should_log) {
+                LogInfo("  Det: class=" + det.class_name + " conf=" + std::to_string(det.confidence));
+                LogInfo("    model_box: x1=" + std::to_string(box[0]) + " y1=" + std::to_string(box[1]) +
+                        " x2=" + std::to_string(box[2]) + " y2=" + std::to_string(box[3]));
+                LogInfo("    restored: x1=" + std::to_string(x1_orig) + " y1=" + std::to_string(y1_orig) +
+                        " x2=" + std::to_string(x2_orig) + " y2=" + std::to_string(y2_orig));
+                LogInfo("    clamped: x1=" + std::to_string(x1_clamped) + " y1=" + std::to_string(y1_clamped) +
+                        " x2=" + std::to_string(x2_clamped) + " y2=" + std::to_string(y2_clamped));
+                LogInfo("    final_bbox: x=" + std::to_string(det.bbox.x) + " y=" + std::to_string(det.bbox.y) +
+                        " w=" + std::to_string(det.bbox.width) + " h=" + std::to_string(det.bbox.height));
+                ++det_log_count;
+                if (det.class_name == "General") ++general_log_count;
+            }
+            detections.push_back(det);
         }
     }
 
@@ -508,6 +1022,31 @@ void HailoInference::SetModelConfig(const std::string& task, int num_keypoints,
             std::to_string(num_keypoints_) + ", labels=" +
             std::to_string(labels_.size()) + ", nms_classes=" +
             std::to_string(num_classes_));
+}
+
+std::shared_ptr<BatchInferenceManager> HailoInference::GetBatchManager(int batch_timeout_ms) {
+    // Only create batch manager for batch > 1
+    if (batch_size_ <= 1) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(batch_manager_mutex_);
+
+    // Create on first call
+    if (!batch_manager_) {
+        // We need a shared_ptr to this, but we're not managed by shared_ptr ourselves
+        // Get the existing shared instance from the static cache
+        auto self = instances_.find(hef_path_);
+        if (self != instances_.end()) {
+            batch_manager_ = std::make_shared<BatchInferenceManager>(
+                self->second, batch_timeout_ms);
+            batch_manager_->Start();
+            LogInfo("Created BatchInferenceManager for " + hef_path_ +
+                    " with batch=" + std::to_string(batch_size_));
+        }
+    }
+
+    return batch_manager_;
 }
 
 }  // namespace stream_daemon
