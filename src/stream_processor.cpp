@@ -313,6 +313,7 @@ StreamProcessor::StreamProcessor(
     , frame_width_(0)   // Auto-detect from RTSP stream
     , frame_height_(0)  // Auto-detect from RTSP stream
     , event_compositor_(std::make_unique<EventCompositor>()) {
+    LogInfo("StreamProcessor created: stream=" + stream_id_ + ", rtsp_url=" + rtsp_url_);
 }
 
 StreamProcessor::~StreamProcessor() {
@@ -354,6 +355,49 @@ VoidResult StreamProcessor::Start() {
     frame_count_ = 0;
     frames_since_last_update_ = 0;
     reconnect_attempts_ = 0;
+    last_frame_time_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        start_time_.time_since_epoch()).count();
+
+    // Start health check thread
+    if (!health_check_running_) {
+        health_check_running_ = true;
+        health_check_thread_ = std::thread([this]() {
+            LogInfo("Health check thread started for " + stream_id_);
+            while (health_check_running_) {
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                if (!health_check_running_) break;
+
+                if (state_ == StreamState::kRunning) {
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                    auto last_frame_ms = last_frame_time_.load();
+                    auto elapsed_ms = now_ms - last_frame_ms;
+
+                    if (elapsed_ms > 5000) {
+                        LogInfo("HealthCheck " + stream_id_ + ": no frames for " +
+                                std::to_string(elapsed_ms / 1000) + "s");
+                    }
+
+                    if (elapsed_ms > 10000) {
+                        LogWarning("Stream " + stream_id_ +
+                                   " no frames for " + std::to_string(elapsed_ms / 1000) +
+                                   "s, triggering reconnect");
+                        SetState(StreamState::kError);
+                        SetError("No frames received (timeout)");
+                        // Schedule reconnect on main thread
+                        g_idle_add([](gpointer data) -> gboolean {
+                            auto* self = static_cast<StreamProcessor*>(data);
+                            self->DestroyPipeline();
+                            self->ScheduleReconnect();
+                            return G_SOURCE_REMOVE;
+                        }, this);
+                        break;  // Exit health check thread
+                    }
+                }
+            }
+            LogInfo("Health check thread stopped for " + stream_id_);
+        });
+    }
 
     // Set to STARTING, will become RUNNING when pipeline reaches PLAYING state
     SetState(StreamState::kRunning);
@@ -369,21 +413,34 @@ void StreamProcessor::Stop() {
 
     LogInfo("Stopping stream: " + stream_id_);
 
+    // Stop health check thread
+    health_check_running_ = false;
+    if (health_check_thread_.joinable()) {
+        health_check_thread_.join();
+    }
+
+    LogInfo("Stop: CancelReconnect...");
     CancelReconnect();
+    LogInfo("Stop: DestroyPipeline...");
     DestroyPipeline();
+    LogInfo("Stop: SetState...");
 
     SetState(StreamState::kStopped);
     LogInfo("Stream stopped: " + stream_id_);
 }
 
 VoidResult StreamProcessor::Update(const StreamInfo& new_info) {
-    LogInfo("Updating stream: " + stream_id_);
+    LogInfo("Updating stream: " + stream_id_ +
+            ", old_url=" + rtsp_url_ +
+            ", new_url=" + new_info.rtsp_url);
 
     // Stop current pipeline
     Stop();
 
-    // Update configuration
-    rtsp_url_ = new_info.rtsp_url;
+    // Update configuration - 빈 URL이면 기존 유지
+    if (!new_info.rtsp_url.empty()) {
+        rtsp_url_ = new_info.rtsp_url;
+    }
     if (!new_info.hef_path.empty()) {
         hef_path_ = new_info.hef_path;
     }
@@ -406,7 +463,7 @@ VoidResult StreamProcessor::Update(const StreamInfo& new_info) {
 }
 
 VoidResult StreamProcessor::ClearInference() {
-    LogInfo("Clearing inference from stream: " + stream_id_);
+    LogInfo("Clearing inference from stream: " + stream_id_ + ", rtsp_url=" + rtsp_url_);
 
     // Stop current pipeline
     Stop();
@@ -562,8 +619,11 @@ VoidResult StreamProcessor::CreatePipeline() {
 }
 
 void StreamProcessor::DestroyPipeline() {
+    LogInfo("DestroyPipeline: start");
+
     // Unregister from batch manager if registered
     if (batch_manager_) {
+        LogInfo("DestroyPipeline: UnregisterStream...");
         batch_manager_->UnregisterStream(stream_id_);
         batch_manager_.reset();
     }
@@ -579,29 +639,34 @@ void StreamProcessor::DestroyPipeline() {
     }
 
     if (pipeline_) {
-        // Non-blocking state change with timeout (2 seconds max)
-        gst_element_set_state(pipeline_, GST_STATE_NULL);
-        GstStateChangeReturn ret = gst_element_get_state(pipeline_, nullptr, nullptr,
-                                                          2 * GST_SECOND);
-        if (ret == GST_STATE_CHANGE_FAILURE || ret == GST_STATE_CHANGE_ASYNC) {
-            LogWarning("Pipeline state change timeout, forcing destroy");
-        }
+        LogInfo("DestroyPipeline: async cleanup...");
 
-        if (appsink_) {
-            gst_object_unref(appsink_);
-            appsink_ = nullptr;
-        }
+        // Capture pointers for async cleanup
+        GstElement* old_pipeline = pipeline_;
+        GstElement* old_appsink = appsink_;
+        GstBus* old_bus = bus_;
 
-        if (bus_) {
-            gst_object_unref(bus_);
-            bus_ = nullptr;
-        }
-
-        gst_object_unref(pipeline_);
+        // Clear our pointers immediately
         pipeline_ = nullptr;
+        appsink_ = nullptr;
+        bus_ = nullptr;
+
+        // Destroy in background thread to avoid blocking
+        std::thread([old_pipeline, old_appsink, old_bus]() {
+            // Set state with short timeout
+            gst_element_set_state(old_pipeline, GST_STATE_NULL);
+            gst_element_get_state(old_pipeline, nullptr, nullptr, 500 * GST_MSECOND);
+
+            if (old_appsink) gst_object_unref(old_appsink);
+            if (old_bus) gst_object_unref(old_bus);
+            gst_object_unref(old_pipeline);
+        }).detach();
+
+        LogInfo("DestroyPipeline: cleanup scheduled");
     }
 
     hailo_probe_id_ = 0;
+    LogInfo("DestroyPipeline: done");
 }
 
 std::string StreamProcessor::BuildPipelineString() const {
@@ -610,9 +675,11 @@ std::string StreamProcessor::BuildPipelineString() const {
     // RTSP source with reconnection settings
     oss << "rtspsrc location=\"" << rtsp_url_ << "\" "
         << "latency=0 "
-        << "timeout=10000000 "
-        << "retry=3 "
+        << "timeout=2000000 "      // 2초 (마이크로초)
+        << "tcp-timeout=2000000 "  // TCP 타임아웃 2초
+        << "retry=1 "
         << "protocols=tcp "
+        << "drop-on-latency=true "
         << "name=src "
         << "! rtph264depay "
         << "! h264parse "
@@ -683,6 +750,8 @@ void StreamProcessor::CancelReconnect() {
 
 void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
     ++frame_count_;
+    last_frame_time_ = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
     UpdateFps();
 
     // Get video frame info
@@ -773,17 +842,26 @@ void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
     event.height = height;
     event.detections = std::move(detections);
 
-    // 이벤트 체크 (각 detection에 event_setting_id 태깅)
+    // 이벤트 체크
     if (!event.detections.empty() && event_compositor_) {
+        // ROI 이벤트 (각 detection에 event_setting_id 태깅)
         event_compositor_->CheckEvents(event.detections, width, height);
 
-        // events 맵 생성 (event_id -> {status, labels})
+        // ROI events 맵 생성 (event_id -> {status, labels})
         for (const auto& det : event.detections) {
             if (!det.event_setting_id.empty()) {
                 auto& ev_status = event.events[det.event_setting_id];
                 ev_status.status = 2;  // ALARM (ROI 내 존재)
                 ev_status.labels.push_back(det.class_name);
             }
+        }
+
+        // Line 이벤트 (키포인트 기반, status 0/1/2)
+        auto line_results = event_compositor_->CheckLineEvents(
+            event.detections, width, height);
+        for (auto& [event_id, result] : line_results) {
+            event.events[event_id].status = result.status;
+            event.events[event_id].labels = std::move(result.labels);
         }
     }
 
@@ -1173,17 +1251,26 @@ void StreamProcessor::OnBatchResult(
     event.height = height;
     event.detections = std::move(detections);
 
-    // 이벤트 체크 (각 detection에 event_setting_id 태깅)
+    // 이벤트 체크
     if (!event.detections.empty() && event_compositor_) {
+        // ROI 이벤트 (각 detection에 event_setting_id 태깅)
         event_compositor_->CheckEvents(event.detections, width, height);
 
-        // events 맵 생성 (event_id -> {status, labels})
+        // ROI events 맵 생성 (event_id -> {status, labels})
         for (const auto& det : event.detections) {
             if (!det.event_setting_id.empty()) {
                 auto& ev_status = event.events[det.event_setting_id];
                 ev_status.status = 2;  // ALARM (ROI 내 존재)
                 ev_status.labels.push_back(det.class_name);
             }
+        }
+
+        // Line 이벤트 (키포인트 기반, status 0/1/2)
+        auto line_results = event_compositor_->CheckLineEvents(
+            event.detections, width, height);
+        for (auto& [event_id, result] : line_results) {
+            event.events[event_id].status = result.status;
+            event.events[event_id].labels = std::move(result.labels);
         }
     }
 

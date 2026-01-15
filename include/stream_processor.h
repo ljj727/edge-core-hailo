@@ -187,12 +187,17 @@ private:
     guint reconnect_source_id_{0};
     gulong hailo_probe_id_{0};
 
+    // Health check thread
+    std::thread health_check_thread_;
+    std::atomic<bool> health_check_running_{false};
+
     // NATS publisher (shared)
     std::shared_ptr<NatsPublisher> nats_publisher_;
 
     // State
     std::atomic<StreamState> state_{StreamState::kStopped};
     std::atomic<uint64_t> frame_count_{0};
+    std::atomic<int64_t> last_frame_time_{0};      // 마지막 프레임 수신 시간 (ms)
     std::atomic<int64_t> last_detection_time_{0};
     std::string last_error_;
     mutable std::mutex error_mutex_;

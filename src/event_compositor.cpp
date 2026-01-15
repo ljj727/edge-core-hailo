@@ -125,19 +125,34 @@ VoidResult EventCompositor::ParseSettings(const std::string& json_str) {
                 }
             }
 
-            // target 파싱
+            // targets 파싱
+            if (config.contains("targets")) {
+                if (config["targets"].is_array()) {
+                    // 배열: ["RV", "General"] 또는 ["ALL"]
+                    for (const auto& t : config["targets"]) {
+                        if (t.is_string()) {
+                            std::string val = t.get<std::string>();
+                            if (val == "ALL" || val == "all") {
+                                // "ALL"이면 전체 대상 → labels 비우고 종료
+                                setting.target.labels.clear();
+                                break;
+                            }
+                            setting.target.labels.push_back(val);
+                        }
+                    }
+                } else if (config["targets"].is_string()) {
+                    // 문자열: "ALL" → 빈 배열 (전체 대상)
+                    std::string val = config["targets"].get<std::string>();
+                    if (val != "ALL" && val != "all") {
+                        setting.target.labels.push_back(val);
+                    }
+                }
+            }
+            // 하위 호환: 단일 target 객체도 지원
             if (config.contains("target") && config["target"].is_object()) {
                 const auto& target = config["target"];
                 if (target.contains("label") && !target["label"].is_null()) {
-                    setting.target.label = target["label"].get<std::string>();
-                }
-                if (target.contains("classType") && !target["classType"].is_null()) {
-                    setting.target.class_type = target["classType"].get<std::string>();
-                }
-                if (target.contains("resultLabel") && target["resultLabel"].is_array()) {
-                    for (const auto& label : target["resultLabel"]) {
-                        setting.target.result_label.push_back(label.get<std::string>());
-                    }
+                    setting.target.labels.push_back(target["label"].get<std::string>());
                 }
             }
 
@@ -151,6 +166,14 @@ VoidResult EventCompositor::ParseSettings(const std::string& json_str) {
             }
             if (config.contains("direction")) {
                 setting.direction = ParseDirection(config["direction"].get<std::string>());
+            }
+            if (config.contains("keypoints") && config["keypoints"].is_array()) {
+                for (const auto& kp : config["keypoints"]) {
+                    setting.keypoints.push_back(kp.get<int>());
+                }
+            }
+            if (config.contains("warningDistance")) {
+                setting.warning_distance = config["warningDistance"].get<float>();
             }
             if (config.contains("inOrder")) {
                 setting.in_order = config["inOrder"].get<bool>();
@@ -286,18 +309,23 @@ bool EventCompositor::MatchesTarget(
     const TargetFilter& target) const {
 
     // 타겟 라벨이 비어있으면 모든 객체 매칭
-    if (target.label.empty()) {
+    if (target.labels.empty()) {
         return true;
     }
 
     // 라벨 매칭 (대소문자 무시)
     std::string det_label = det.class_name;
-    std::string target_label = target.label;
-
     std::transform(det_label.begin(), det_label.end(), det_label.begin(), ::tolower);
-    std::transform(target_label.begin(), target_label.end(), target_label.begin(), ::tolower);
 
-    return det_label == target_label;
+    for (const auto& target_label : target.labels) {
+        std::string lower_target = target_label;
+        std::transform(lower_target.begin(), lower_target.end(), lower_target.begin(), ::tolower);
+        if (det_label == lower_target) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 Point2D EventCompositor::GetDetectionPoint(
@@ -396,6 +424,212 @@ std::optional<EventSetting> EventCompositor::GetSetting(
         return it->second;
     }
     return std::nullopt;
+}
+
+// ============================================================================
+// Line Event Detection
+// ============================================================================
+
+float EventCompositor::PointToLineDistance(
+    const Point2D& point,
+    const Point2D& line_a,
+    const Point2D& line_b) const {
+
+    // 점과 직선 사이의 수직 거리 공식
+    // |((y2-y1)*px - (x2-x1)*py + x2*y1 - y2*x1)| / sqrt((y2-y1)² + (x2-x1)²)
+    float dx = line_b.x - line_a.x;
+    float dy = line_b.y - line_a.y;
+
+    float numerator = std::abs(dy * point.x - dx * point.y +
+                               line_b.x * line_a.y - line_b.y * line_a.x);
+    float denominator = std::sqrt(dy * dy + dx * dx);
+
+    if (denominator < 1e-6f) {
+        // 라인이 점인 경우 (두 점이 같은 위치)
+        float px = point.x - line_a.x;
+        float py = point.y - line_a.y;
+        return std::sqrt(px * px + py * py);
+    }
+
+    return numerator / denominator;
+}
+
+float EventCompositor::PointLineSide(
+    const Point2D& point,
+    const Point2D& line_a,
+    const Point2D& line_b) const {
+
+    // Cross product로 점이 직선의 어느 쪽에 있는지 판별
+    // (B - A) × (P - A) = (bx-ax)(py-ay) - (by-ay)(px-ax)
+    // 양수: 왼쪽 (A->B 기준), 음수: 오른쪽
+    return (line_b.x - line_a.x) * (point.y - line_a.y) -
+           (line_b.y - line_a.y) * (point.x - line_a.x);
+}
+
+int EventCompositor::CheckLineEvent(
+    const EventSetting& setting,
+    const Detection& det,
+    int frame_width,
+    int frame_height) const {
+
+    // 타겟 필터 매칭 확인
+    if (!MatchesTarget(det, setting.target)) {
+        return 0;  // SAFE - 대상 아님
+    }
+
+    // 라인 좌표 필요 (2점)
+    if (setting.points.size() < 2) {
+        return 0;
+    }
+
+    const Point2D& line_a = setting.points[0];
+    const Point2D& line_b = setting.points[1];
+
+    // 키포인트가 없거나 설정된 키포인트 인덱스가 없으면 bbox 기준점 사용
+    if (det.keypoints.empty() || setting.keypoints.empty()) {
+        Point2D point = GetDetectionPoint(det, setting.detection_point,
+                                          frame_width, frame_height);
+
+        float distance = PointToLineDistance(point, line_a, line_b);
+        float side = PointLineSide(point, line_a, line_b);
+
+        // direction에 따른 판정 (화면 좌표계: Y축 아래로 증가)
+        // A2B: A→B 벡터 기준 오른쪽이 danger (side > 0)
+        // B2A: A→B 벡터 기준 왼쪽이 danger (side < 0)
+        bool on_danger_side = false;
+        if (setting.direction == LineDirection::kA2B) {
+            on_danger_side = (side > 0);  // 화면좌표계 보정
+        } else if (setting.direction == LineDirection::kB2A) {
+            on_danger_side = (side < 0);  // 화면좌표계 보정
+        } else {
+            // BOTH: 라인 근처면 WARNING, 아무 쪽이든 넘어가면 DANGER
+            if (distance < setting.warning_distance) {
+                return 1;  // WARNING
+            }
+            return 0;  // SAFE (BOTH에서는 DANGER 없음)
+        }
+
+        if (on_danger_side) {
+            return 2;  // DANGER - 라인 넘어감
+        } else if (distance < setting.warning_distance) {
+            return 1;  // WARNING - 라인 근처
+        }
+        return 0;  // SAFE
+    }
+
+    // 키포인트 기반 판정
+    int max_status = 0;
+
+    for (int kp_idx : setting.keypoints) {
+        // 키포인트 인덱스 범위 체크 (0-based)
+        if (kp_idx < 0 || kp_idx >= static_cast<int>(det.keypoints.size())) {
+            continue;
+        }
+        int idx = kp_idx;
+
+        const auto& kp = det.keypoints[idx];
+
+        // visibility 체크 (너무 낮으면 스킵)
+        if (kp.visible < 0.3f) {
+            continue;
+        }
+
+        // 키포인트 좌표 (이미 정규화된 상태)
+        Point2D point{kp.x, kp.y};
+
+        float distance = PointToLineDistance(point, line_a, line_b);
+        float side = PointLineSide(point, line_a, line_b);
+
+        // Debug: Line event calculation
+        static int line_debug_count = 0;
+        if (line_debug_count++ < 30) {
+            LogInfo("Line[" + setting.event_setting_id + "] kp" + std::to_string(kp_idx) +
+                    ": pos=(" + std::to_string(point.x) + "," + std::to_string(point.y) +
+                    ") dist=" + std::to_string(distance) +
+                    " warn=" + std::to_string(setting.warning_distance) +
+                    " side=" + std::to_string(side));
+        }
+
+        int status = 0;
+
+        // direction에 따른 판정 (화면 좌표계: Y축 아래로 증가)
+        // A2B: A→B 벡터 기준 오른쪽이 danger (side > 0)
+        // B2A: A→B 벡터 기준 왼쪽이 danger (side < 0)
+        bool on_danger_side = false;
+        if (setting.direction == LineDirection::kA2B) {
+            on_danger_side = (side > 0);  // 화면좌표계 보정
+        } else if (setting.direction == LineDirection::kB2A) {
+            on_danger_side = (side < 0);  // 화면좌표계 보정
+        } else {
+            // BOTH
+            if (distance < setting.warning_distance) {
+                status = 1;
+            }
+            max_status = std::max(max_status, status);
+            continue;
+        }
+
+        if (on_danger_side) {
+            status = 2;  // DANGER
+        } else if (distance < setting.warning_distance) {
+            status = 1;  // WARNING
+        }
+
+        max_status = std::max(max_status, status);
+
+        // DANGER면 더 체크할 필요 없음
+        if (max_status == 2) {
+            break;
+        }
+    }
+
+    return max_status;
+}
+
+std::unordered_map<std::string, LineEventResult> EventCompositor::CheckLineEvents(
+    const std::vector<Detection>& detections,
+    int frame_width,
+    int frame_height) {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::unordered_map<std::string, LineEventResult> results;
+
+    if (settings_.empty() || detections.empty()) {
+        return results;
+    }
+
+    // 모든 Line 이벤트에 대해 체크
+    for (const auto& [id, setting] : settings_) {
+        if (setting.event_type != EventType::kLine) {
+            continue;
+        }
+
+        LineEventResult result;
+        result.status = 0;  // SAFE
+
+        // 모든 detection에 대해 체크
+        for (const auto& det : detections) {
+            int status = CheckLineEvent(setting, det, frame_width, frame_height);
+
+            if (status > result.status) {
+                result.status = status;
+            }
+
+            // 이 detection이 이벤트에 해당하면 라벨 추가
+            if (status > 0) {
+                // 중복 체크
+                auto it = std::find(result.labels.begin(), result.labels.end(), det.class_name);
+                if (it == result.labels.end()) {
+                    result.labels.push_back(det.class_name);
+                }
+            }
+        }
+
+        results[id] = std::move(result);
+    }
+
+    return results;
 }
 
 }  // namespace stream_daemon

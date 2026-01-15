@@ -53,7 +53,7 @@ enum class LineDirection {
 
 // 타겟 필터
 struct TargetFilter {
-    std::string label;                    // "person", "car" 등
+    std::vector<std::string> labels;      // ["RV", "General"] 등 (복수)
     std::string class_type;               // classifier 타입
     std::vector<std::string> result_label; // 세부 라벨
 };
@@ -77,6 +77,8 @@ struct EventSetting {
 
     // Line 옵션
     LineDirection direction{LineDirection::kBoth};
+    std::vector<int> keypoints;           // 감지할 키포인트 인덱스 [1, 2] 등
+    float warning_distance{0.1f};         // WARNING 영역 거리 (정규화 좌표)
 
     // And/Or 옵션
     bool in_order{false};
@@ -93,6 +95,12 @@ struct EventSetting {
 
     // 자식 이벤트 ID 목록 (런타임에 구성)
     std::vector<std::string> children;
+};
+
+// Line 이벤트 결과
+struct LineEventResult {
+    int status{0};                        // 0=SAFE, 1=WARNING, 2=DANGER
+    std::vector<std::string> labels;      // 해당 라벨들
 };
 
 /**
@@ -127,6 +135,18 @@ public:
      */
     void CheckEvents(
         std::vector<Detection>& detections,
+        int frame_width,
+        int frame_height);
+
+    /**
+     * @brief Line 이벤트 체크 (키포인트 기반)
+     * @param detections 현재 프레임 감지 결과
+     * @param frame_width 프레임 너비
+     * @param frame_height 프레임 높이
+     * @return event_setting_id -> LineEventResult 맵
+     */
+    [[nodiscard]] std::unordered_map<std::string, LineEventResult> CheckLineEvents(
+        const std::vector<Detection>& detections,
         int frame_width,
         int frame_height);
 
@@ -188,6 +208,33 @@ private:
     [[nodiscard]] bool MatchesTarget(
         const Detection& det,
         const TargetFilter& target) const;
+
+    /**
+     * @brief Line 이벤트 체크 (단일 detection)
+     * @return 0=SAFE, 1=WARNING, 2=DANGER
+     */
+    [[nodiscard]] int CheckLineEvent(
+        const EventSetting& setting,
+        const Detection& det,
+        int frame_width,
+        int frame_height) const;
+
+    /**
+     * @brief 점과 직선 사이의 수직 거리 계산
+     */
+    [[nodiscard]] float PointToLineDistance(
+        const Point2D& point,
+        const Point2D& line_a,
+        const Point2D& line_b) const;
+
+    /**
+     * @brief 점이 직선의 어느 쪽에 있는지 판별
+     * @return >0: A->B 방향 기준 왼쪽, <0: 오른쪽, =0: 선 위
+     */
+    [[nodiscard]] float PointLineSide(
+        const Point2D& point,
+        const Point2D& line_a,
+        const Point2D& line_b) const;
 
     // 이벤트 설정 저장 (event_setting_id -> EventSetting)
     std::unordered_map<std::string, EventSetting> settings_;

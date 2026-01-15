@@ -179,17 +179,8 @@ VoidResult HailoInference::Initialize(const std::string& hef_path) {
         input_height_ = input_info.shape.height;
         input_width_ = input_info.shape.width;
 
-        // Get batch size from network group (not from shape.features which is RGB channels)
-        // HailoRT stores batch info in the frame size - single frame size * batch = total
-        // For now, infer from model name or use a config
-        batch_size_ = 1;  // Default to 1
-
-        // Check if model name contains batch indicator
-        if (hef_path_.find("batch2") != std::string::npos) {
-            batch_size_ = 2;
-        } else if (hef_path_.find("batch4") != std::string::npos) {
-            batch_size_ = 4;
-        }
+        // Use batch=1 for stable operation
+        batch_size_ = 1;
 
         LogInfo("Model input: " + std::to_string(input_width_) + "x" +
                 std::to_string(input_height_) + ", batch=" + std::to_string(batch_size_));
@@ -250,6 +241,7 @@ VoidResult HailoInference::Initialize(const std::string& hef_path) {
     }
 
     // Create buffers for ALL output vstreams (critical for multi-output models like best12.hef)
+    // Each read() returns one frame's output, so buffer size = single frame size
     output_buffers_.resize(output_vstreams_.size());
     output_frame_sizes_.resize(output_vstreams_.size());
 
@@ -399,14 +391,14 @@ std::unordered_map<std::string, std::vector<Detection>> HailoInference::RunBatch
                 ", frames=" + std::to_string(num_frames) + "/" + std::to_string(batch_size_));
     }
 
-    // Prepare batch input buffer (batch_size_ frames, each input_frame_size_ bytes)
+    // Prepare per-frame buffers (Hailo batch = multiple write() calls, not concatenated buffer)
     const size_t single_frame_size = input_width_ * input_height_ * 3;
-    std::vector<uint8_t> batch_buffer(batch_size_ * single_frame_size, 114);  // Pad with gray
+    std::vector<std::vector<uint8_t>> frame_buffers(batch_size_, std::vector<uint8_t>(single_frame_size, 114));
     std::vector<LetterboxInfo> letterbox_infos(batch_size_);
 
     // Process each frame in the batch
     for (int i = 0; i < batch_size_; ++i) {
-        uint8_t* dst = batch_buffer.data() + i * single_frame_size;
+        uint8_t* dst = frame_buffers[i].data();
 
         if (i < num_frames) {
             const auto& frame = frames[i];
@@ -425,58 +417,44 @@ std::unordered_map<std::string, std::vector<Detection>> HailoInference::RunBatch
         // Else: already padded with gray (114)
     }
 
-    // Write batch to input vstream
-    auto status = input_vstreams_[0].write(
-        hailort::MemoryView(batch_buffer.data(), batch_buffer.size()));
-    if (status != HAILO_SUCCESS) {
-        LogWarning("RunBatchInference: failed to write input: " + std::to_string(static_cast<int>(status)));
-        return results;
-    }
-
-    // Read from all output vstreams
-    for (size_t i = 0; i < output_vstreams_.size(); ++i) {
-        status = output_vstreams_[i].read(
-            hailort::MemoryView(output_buffers_[i].data(), output_buffers_[i].size()));
+    // Write each frame separately (Hailo batch_size=N means N sequential writes before read)
+    hailo_status status;
+    for (int i = 0; i < batch_size_; ++i) {
+        status = input_vstreams_[0].write(
+            hailort::MemoryView(frame_buffers[i].data(), frame_buffers[i].size()));
         if (status != HAILO_SUCCESS) {
-            LogWarning("RunBatchInference: failed to read output[" + std::to_string(i) + "]");
+            LogWarning("RunBatchInference: failed to write frame " + std::to_string(i) +
+                      ": " + std::to_string(static_cast<int>(status)));
             return results;
         }
     }
 
-    // Parse outputs for each frame in batch
-    // For batch models, output buffers contain interleaved or sequential batch results
-    // We need to extract per-frame results
+    // For batch mode: read and parse each frame's outputs separately
+    // Hailo batch = multiple write() calls followed by multiple read() calls
+    // Each read() returns one frame's output
+    for (int frame_idx = 0; frame_idx < actual_batch && frame_idx < num_frames; ++frame_idx) {
+        // Read from all output vstreams for this frame
+        for (size_t i = 0; i < output_vstreams_.size(); ++i) {
+            status = output_vstreams_[i].read(
+                hailort::MemoryView(output_buffers_[i].data(), output_buffers_[i].size()));
+            if (status != HAILO_SUCCESS) {
+                LogWarning("RunBatchInference: failed to read output[" + std::to_string(i) +
+                          "] for frame " + std::to_string(frame_idx));
+                return results;
+            }
+        }
 
-    for (int i = 0; i < actual_batch && i < num_frames; ++i) {
-        const auto& frame = frames[i];
+        // Parse outputs for this frame
+        const auto& frame = frames[frame_idx];
         std::vector<Detection> detections;
 
         if (is_raw_yolo_output_ && !output_buffers_.empty()) {
-            // For multi-output models, outputs are per-batch
-            // Each output buffer is: [batch, channels, height, width] flattened
-            // We need to extract the i-th batch slice
-
-            std::vector<std::vector<uint8_t>> frame_outputs(output_buffers_.size());
-            for (size_t out_idx = 0; out_idx < output_buffers_.size(); ++out_idx) {
-                size_t per_batch_size = output_buffers_[out_idx].size() / batch_size_;
-                frame_outputs[out_idx].resize(per_batch_size);
-                std::memcpy(frame_outputs[out_idx].data(),
-                           output_buffers_[out_idx].data() + i * per_batch_size,
-                           per_batch_size);
-            }
-
-            detections = ParseRawYoloOutput(frame_outputs, confidence_threshold, 0.45f,
-                                             frame.width, frame.height, letterbox_infos[i]);
+            // output_buffers_ now contains single frame outputs (already read)
+            detections = ParseRawYoloOutput(output_buffers_, confidence_threshold, 0.45f,
+                                             frame.width, frame.height, letterbox_infos[frame_idx]);
         } else if (is_nms_output_ && !output_buffers_.empty()) {
-            // For NMS output, extract per-batch slice
-            size_t per_batch_size = output_buffers_[0].size() / batch_size_;
-            std::vector<uint8_t> frame_output(per_batch_size);
-            std::memcpy(frame_output.data(),
-                       output_buffers_[0].data() + i * per_batch_size,
-                       per_batch_size);
-
-            detections = ParseNmsOutput(frame_output, confidence_threshold,
-                                         frame.width, frame.height, letterbox_infos[i]);
+            detections = ParseNmsOutput(output_buffers_[0], confidence_threshold,
+                                         frame.width, frame.height, letterbox_infos[frame_idx]);
         }
 
         results[frame.stream_id] = std::move(detections);
@@ -976,8 +954,8 @@ std::vector<Detection> HailoInference::ParseRawYoloOutput(
                 kp_y_orig = std::max(0.0f, std::min(kp_y_orig, static_cast<float>(frame_height - 1)));
 
                 Keypoint keypoint;
-                keypoint.x = kp_x_orig;  // Pixel coordinates
-                keypoint.y = kp_y_orig;
+                keypoint.x = kp_x_orig / frame_width;   // Normalize to 0-1
+                keypoint.y = kp_y_orig / frame_height;  // Normalize to 0-1
                 keypoint.visible = kp[2];
                 det.keypoints.push_back(keypoint);
             }

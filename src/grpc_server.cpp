@@ -13,24 +13,27 @@ using json = nlohmann::json;
 
 namespace {
 
-// Status 코드 변환
-constexpr int kStatusNG = 0;
-constexpr int kStatusReady = 1;
-constexpr int kStatusConnecting = 2;
-constexpr int kStatusConnected = 3;
+// Status 코드 변환 (Backend와 맞춤)
+constexpr int kStatusStarting = 0;
+constexpr int kStatusRunning = 1;
+constexpr int kStatusStopped = 2;
+constexpr int kStatusError = 3;
+constexpr int kStatusReconnecting = 4;
 
 [[nodiscard]] int StateToStatus(StreamState state) {
     switch (state) {
-        case StreamState::kStopped:
-            return kStatusReady;
         case StreamState::kStarting:
-        case StreamState::kReconnecting:
-            return kStatusConnecting;
+            return kStatusStarting;
         case StreamState::kRunning:
-            return kStatusConnected;
+            return kStatusRunning;
+        case StreamState::kStopped:
+            return kStatusStopped;
         case StreamState::kError:
+            return kStatusError;
+        case StreamState::kReconnecting:
+            return kStatusReconnecting;
         default:
-            return kStatusNG;
+            return kStatusStopped;
     }
 }
 
@@ -73,8 +76,8 @@ void ToProto(const ModelInfo& info, autocare::Model* proto) {
     }
 
     // Add labels (단순 라벨 목록)
-    for (const auto& output : info.outputs) {
-        proto->add_labels(output.label);
+    for (const auto& label : info.labels) {
+        proto->add_labels(label);
     }
 }
 
@@ -245,14 +248,14 @@ public:
         // 검증: camera_id, uri 필수
         if (request->camera_id().empty()) {
             response->set_result(false);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message("camera_id is required");
             return grpc::Status::OK;
         }
 
         if (request->uri().empty()) {
             response->set_result(false);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message("uri is required");
             return grpc::Status::OK;
         }
@@ -283,12 +286,12 @@ public:
         if (IsOk(result)) {
             response->set_result(true);
             response->set_camera_id(request->camera_id());
-            response->set_status(kStatusConnecting);
+            response->set_status(kStatusStarting);
             LogInfo("AddCamera: Camera '" + request->camera_id() + "' added");
         } else {
             response->set_result(false);
             response->set_camera_id(request->camera_id());
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message(GetError(result));
         }
 
@@ -304,7 +307,7 @@ public:
 
         if (request->camera_id().empty()) {
             response->set_result(false);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message("camera_id is required");
             return grpc::Status::OK;
         }
@@ -324,12 +327,12 @@ public:
             }
             response->set_result(true);
             response->set_camera_id(request->camera_id());
-            response->set_status(kStatusReady);
+            response->set_status(kStatusStopped);
             LogInfo("RemoveCamera: Camera '" + request->camera_id() + "' removed");
         } else {
             response->set_result(false);
             response->set_camera_id(request->camera_id());
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message(GetError(result));
         }
 
@@ -360,7 +363,7 @@ public:
 
         if (request->camera_id().empty()) {
             response->set_result(false);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message("camera_id is required");
             return grpc::Status::OK;
         }
@@ -377,7 +380,7 @@ public:
         } else {
             response->set_result(false);
             response->set_camera_id(request->camera_id());
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_message("Camera not found");
         }
 
@@ -397,7 +400,7 @@ public:
         // 검증: stream_id 필수
         if (request->stream_id().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"stream_id is required\"}");
             return grpc::Status::OK;
@@ -412,7 +415,7 @@ public:
 
             if (request->app_id().empty()) {
                 response->set_count(0);
-                response->set_status(kStatusNG);
+                response->set_status(kStatusError);
                 response->set_err(true);
                 response->set_meta("{\"error\":\"app_id is required to attach model to existing camera\"}");
                 return grpc::Status::OK;
@@ -421,7 +424,7 @@ public:
             auto model = model_registry_->GetModel(request->app_id());
             if (!model) {
                 response->set_count(0);
-                response->set_status(kStatusNG);
+                response->set_status(kStatusError);
                 response->set_err(true);
                 response->set_meta("{\"error\":\"app not found\"}");
                 return grpc::Status::OK;
@@ -452,14 +455,14 @@ public:
             if (IsOk(result)) {
                 model_registry_->IncrementUsage(request->app_id());
                 response->set_count(1);
-                response->set_status(kStatusConnecting);
+                response->set_status(kStatusStarting);
                 response->set_err(false);
                 response->set_app_id(request->app_id());
                 response->set_stream_id(request->stream_id());
                 LogInfo("AddInference: Model attached, pipeline restarting");
             } else {
                 response->set_count(0);
-                response->set_status(kStatusNG);
+                response->set_status(kStatusError);
                 response->set_err(true);
                 response->set_meta("{\"error\":\"" + GetError(result) + "\"}");
             }
@@ -470,7 +473,7 @@ public:
         // 새 스트림 생성
         if (request->uri().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"uri is required for new stream\"}");
             return grpc::Status::OK;
@@ -486,7 +489,7 @@ public:
             auto model = model_registry_->GetModel(request->app_id());
             if (!model) {
                 response->set_count(0);
-                response->set_status(kStatusNG);
+                response->set_status(kStatusError);
                 response->set_err(true);
                 response->set_meta("{\"error\":\"app not found\"}");
                 return grpc::Status::OK;
@@ -511,13 +514,13 @@ public:
                 model_registry_->IncrementUsage(request->app_id());
             }
             response->set_count(1);
-            response->set_status(kStatusConnecting);
+            response->set_status(kStatusStarting);
             response->set_err(false);
             response->set_app_id(request->app_id());
             response->set_stream_id(request->stream_id());
         } else {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"" + GetError(result) + "\"}");
         }
@@ -534,7 +537,7 @@ public:
 
         if (request->stream_id().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"stream_id is required\"}");
             return grpc::Status::OK;
@@ -555,13 +558,13 @@ public:
                 model_registry_->DecrementUsage(model_id);
             }
             response->set_count(1);
-            response->set_status(kStatusReady);
+            response->set_status(kStatusStopped);
             response->set_err(false);
             response->set_stream_id(request->stream_id());
             LogInfo("RemoveInference: Inference cleared, camera still running");
         } else {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"" + GetError(result) + "\"}");
         }
@@ -609,7 +612,7 @@ public:
 
         if (request->stream_id().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"stream_id is required\"}");
             return grpc::Status::OK;
@@ -627,7 +630,7 @@ public:
             auto model = model_registry_->GetModel(request->app_id());
             if (!model) {
                 response->set_count(0);
-                response->set_status(kStatusNG);
+                response->set_status(kStatusError);
                 response->set_err(true);
                 response->set_meta("{\"error\":\"app not found\"}");
                 return grpc::Status::OK;
@@ -647,12 +650,12 @@ public:
 
         if (IsOk(result)) {
             response->set_count(1);
-            response->set_status(kStatusConnecting);
+            response->set_status(kStatusStarting);
             response->set_err(false);
             response->set_stream_id(request->stream_id());
         } else {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"" + GetError(result) + "\"}");
         }
@@ -669,7 +672,7 @@ public:
 
         if (request->stream_id().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             return grpc::Status::OK;
         }
@@ -687,7 +690,7 @@ public:
             }
         } else {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
         }
 
@@ -754,7 +757,7 @@ public:
 
         if (request->stream_id().empty()) {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             return grpc::Status::OK;
         }
@@ -764,13 +767,13 @@ public:
 
         if (snapshot && !snapshot->empty()) {
             response->set_count(1);
-            response->set_status(kStatusConnected);
+            response->set_status(kStatusRunning);
             response->set_err(false);
             response->set_snapshot(snapshot->data(), snapshot->size());
             response->set_stream_id(request->stream_id());
         } else {
             response->set_count(0);
-            response->set_status(kStatusNG);
+            response->set_status(kStatusError);
             response->set_err(true);
             response->set_meta("{\"error\":\"snapshot not available\"}");
         }
