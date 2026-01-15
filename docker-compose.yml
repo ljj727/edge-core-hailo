@@ -27,12 +27,9 @@ services:
     ports:
       - "${NATS_PORT:-4223}:4222"
       - "${NATS_WS_PORT:-4224}:8080"
-    command:
-      - "--port=4222"
-      - "--http_port=8222"
-      - "--websocket_port=8080"
-      - "--websocket_no_tls=true"
-      - "--max_payload=8MB"
+    volumes:
+      - ./nats-docker.conf:/etc/nats/nats.conf:ro
+    command: ["-c", "/etc/nats/nats.conf"]
     networks:
       - app-network
 
