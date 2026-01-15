@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  stream-daemon:
+    build: .
+    image: stream-daemon:latest
+    container_name: stream-daemon
+    restart: unless-stopped
+    devices:
+      - /dev/hailo0:/dev/hailo0
+    volumes:
+      - ${CONFIG_PATH:-./config}:/app/config:ro
+      - ${MODELS_PATH:-./models}:/app/models:ro
+    ports:
+      - "${GRPC_PORT:-50052}:50052"
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - nats
+    networks:
+      - app-network
+
+  nats:
+    image: nats:latest
+    container_name: nats
+    restart: unless-stopped
+    ports:
+      - "${NATS_PORT:-4223}:4222"
+      - "${NATS_WS_PORT:-4224}:8080"
+    command:
+      - "--port=4222"
+      - "--http_port=8222"
+      - "--websocket_port=8080"
+      - "--websocket_no_tls=true"
+      - "--max_payload=8MB"
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
