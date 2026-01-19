@@ -81,7 +81,7 @@ struct Detection {
     int class_id{0};
     float confidence{0.0f};
     BoundingBox bbox;
-    std::string event_setting_id;  // 이 객체가 발생시킨 이벤트 (비어있으면 없음)
+    std::vector<std::string> event_setting_ids;  // 이 객체가 발생시킨 이벤트들 (복수 ROI 지원)
     std::vector<Keypoint> keypoints;  // pose keypoints (4 points for vehicle)
 };
 

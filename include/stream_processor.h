@@ -196,6 +196,9 @@ private:
 
     // State
     std::atomic<StreamState> state_{StreamState::kStopped};
+    std::atomic<bool> stopping_{false};  // Set true during cleanup to block callbacks
+    std::atomic<int> active_callbacks_{0};  // Count of callbacks currently running
+    std::atomic<bool> processing_frame_{false};  // Skip frames while processing
     std::atomic<uint64_t> frame_count_{0};
     std::atomic<int64_t> last_frame_time_{0};      // 마지막 프레임 수신 시간 (ms)
     std::atomic<int64_t> last_detection_time_{0};

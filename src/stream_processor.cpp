@@ -329,6 +329,9 @@ VoidResult StreamProcessor::Start() {
         return MakeOk();
     }
 
+    // Reset stopping flag (may be set from previous Stop)
+    stopping_.store(false, std::memory_order_release);
+
     SetState(StreamState::kStarting);
     LogInfo("Starting stream: " + stream_id_);
 
@@ -639,6 +642,27 @@ void StreamProcessor::DestroyPipeline() {
     }
 
     if (pipeline_) {
+        LogInfo("DestroyPipeline: setting stopping flag...");
+
+        // STEP 1: Set stopping flag to prevent new callbacks from running
+        stopping_.store(true, std::memory_order_release);
+
+        // STEP 2: Disconnect signal to prevent NEW callbacks
+        if (appsink_) {
+            g_signal_handlers_disconnect_by_func(
+                appsink_, reinterpret_cast<gpointer>(OnNewSample), this);
+        }
+
+        // STEP 3: Wait for any in-flight callbacks to complete (max 100ms)
+        int wait_count = 0;
+        while (active_callbacks_.load(std::memory_order_acquire) > 0 && wait_count < 100) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++wait_count;
+        }
+        if (wait_count > 0) {
+            LogInfo("DestroyPipeline: waited " + std::to_string(wait_count) + "ms for callbacks");
+        }
+
         LogInfo("DestroyPipeline: async cleanup...");
 
         // Capture pointers for async cleanup
@@ -646,16 +670,16 @@ void StreamProcessor::DestroyPipeline() {
         GstElement* old_appsink = appsink_;
         GstBus* old_bus = bus_;
 
-        // Clear our pointers immediately
+        // Clear our pointers immediately (prevents any further access)
         pipeline_ = nullptr;
         appsink_ = nullptr;
         bus_ = nullptr;
 
-        // Destroy in background thread to avoid blocking
+        // Full cleanup in background thread to avoid blocking gRPC
         std::thread([old_pipeline, old_appsink, old_bus]() {
-            // Set state with short timeout
+            // Stop pipeline (can be slow with unresponsive RTSP)
             gst_element_set_state(old_pipeline, GST_STATE_NULL);
-            gst_element_get_state(old_pipeline, nullptr, nullptr, 500 * GST_MSECOND);
+            gst_element_get_state(old_pipeline, nullptr, nullptr, 3 * GST_SECOND);
 
             if (old_appsink) gst_object_unref(old_appsink);
             if (old_bus) gst_object_unref(old_bus);
@@ -699,8 +723,10 @@ std::string StreamProcessor::BuildPipelineString() const {
     }
 
     // Output to appsink (RGB format for JPEG encoding and inference)
-    // No videoscale - preserve original RTSP stream resolution
-    oss << "! videoconvert "
+    // Large queue with leaky=downstream allows RTSP to buffer ahead
+    // and drop old frames, keeping the stream at real-time speed
+    oss << "! queue max-size-buffers=3 leaky=downstream "
+        << "! videoconvert "
         << "! video/x-raw,format=RGB "
         << "! appsink name=sink emit-signals=true max-buffers=1 drop=true sync=false";
 
@@ -847,10 +873,10 @@ void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
         // ROI 이벤트 (각 detection에 event_setting_id 태깅)
         event_compositor_->CheckEvents(event.detections, width, height);
 
-        // ROI events 맵 생성 (event_id -> {status, labels})
+        // ROI events 맵 생성 (event_id -> {status, labels}) - 복수 ROI 지원
         for (const auto& det : event.detections) {
-            if (!det.event_setting_id.empty()) {
-                auto& ev_status = event.events[det.event_setting_id];
+            for (const auto& event_id : det.event_setting_ids) {
+                auto& ev_status = event.events[event_id];
                 ev_status.status = 2;  // ALARM (ROI 내 존재)
                 ev_status.labels.push_back(det.class_name);
             }
@@ -946,8 +972,34 @@ void StreamProcessor::SetError(std::string_view error) {
 GstFlowReturn StreamProcessor::OnNewSample(GstElement* sink, gpointer user_data) {
     auto* self = static_cast<StreamProcessor*>(user_data);
 
+    // Check if we're stopping - exit early without accessing self
+    if (self->stopping_.load(std::memory_order_acquire)) {
+        return GST_FLOW_EOS;
+    }
+
+    // Skip frame if still processing previous one (keeps RTSP flowing at full rate)
+    bool expected = false;
+    if (!self->processing_frame_.compare_exchange_strong(expected, true)) {
+        // Already processing - pull and discard to keep pipeline flowing
+        GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
+        if (sample) gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    // Track active callback (for safe cleanup)
+    self->active_callbacks_.fetch_add(1, std::memory_order_relaxed);
+
+    // Double-check after incrementing counter
+    if (self->stopping_.load(std::memory_order_acquire)) {
+        self->active_callbacks_.fetch_sub(1, std::memory_order_relaxed);
+        self->processing_frame_.store(false, std::memory_order_release);
+        return GST_FLOW_EOS;
+    }
+
     GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
     if (!sample) {
+        self->active_callbacks_.fetch_sub(1, std::memory_order_relaxed);
+        self->processing_frame_.store(false, std::memory_order_release);
         return GST_FLOW_ERROR;
     }
 
@@ -957,6 +1009,8 @@ GstFlowReturn StreamProcessor::OnNewSample(GstElement* sink, gpointer user_data)
     }
 
     gst_sample_unref(sample);
+    self->processing_frame_.store(false, std::memory_order_release);
+    self->active_callbacks_.fetch_sub(1, std::memory_order_relaxed);
     return GST_FLOW_OK;
 }
 
@@ -1256,10 +1310,10 @@ void StreamProcessor::OnBatchResult(
         // ROI 이벤트 (각 detection에 event_setting_id 태깅)
         event_compositor_->CheckEvents(event.detections, width, height);
 
-        // ROI events 맵 생성 (event_id -> {status, labels})
+        // ROI events 맵 생성 (event_id -> {status, labels}) - 복수 ROI 지원
         for (const auto& det : event.detections) {
-            if (!det.event_setting_id.empty()) {
-                auto& ev_status = event.events[det.event_setting_id];
+            for (const auto& event_id : det.event_setting_ids) {
+                auto& ev_status = event.events[event_id];
                 ev_status.status = 2;  // ALARM (ROI 내 존재)
                 ev_status.labels.push_back(det.class_name);
             }

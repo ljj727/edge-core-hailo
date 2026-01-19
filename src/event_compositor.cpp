@@ -243,12 +243,7 @@ void EventCompositor::CheckEvents(
 
     // 각 detection에 대해 이벤트 체크
     for (auto& det : detections) {
-        // 이미 이벤트가 설정되어 있으면 스킵 (첫 번째 매칭만)
-        if (!det.event_setting_id.empty()) {
-            continue;
-        }
-
-        // 모든 이벤트 설정에 대해 체크
+        // 모든 이벤트 설정에 대해 체크 (복수 ROI 지원)
         for (const auto& [id, setting] : settings_) {
             bool matched = false;
 
@@ -271,10 +266,9 @@ void EventCompositor::CheckEvents(
                     break;
             }
 
-            // 매칭되면 이벤트 ID 태깅하고 다음 detection으로
+            // 매칭되면 이벤트 ID 추가 (복수 ROI 허용)
             if (matched) {
-                det.event_setting_id = id;
-                break;  // 첫 번째 매칭 이벤트만 설정
+                det.event_setting_ids.push_back(id);
             }
         }
     }

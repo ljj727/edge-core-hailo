@@ -24,7 +24,7 @@ stream:
   fps: 30
 
   # 탐지 설정
-  confidence_threshold: 0.5
+  confidence_threshold: 0.3
 
   # 클래스 필터 (빈 배열이면 모든 클래스 탐지)
   # 예: ["person", "car", "truck"]

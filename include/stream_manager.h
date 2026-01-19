@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -183,6 +184,9 @@ private:
     // Stream storage
     std::map<std::string, std::unique_ptr<StreamProcessor>, std::less<>> streams_;
     mutable std::mutex streams_mutex_;
+
+    // Streams being removed (防御 code for rapid remove/add)
+    std::set<std::string> removing_streams_;
 
     // NATS publisher (shared among all streams)
     std::shared_ptr<NatsPublisher> nats_publisher_;

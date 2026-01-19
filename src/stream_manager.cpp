@@ -140,6 +140,11 @@ void StreamManager::MainLoopThread() {
 VoidResult StreamManager::AddStream(const StreamInfo& info) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
 
+    // Check if stream is being removed (防御 code)
+    if (removing_streams_.count(info.stream_id) > 0) {
+        return MakeError("Stream " + info.stream_id + " is being removed, please wait");
+    }
+
     // Check if stream already exists
     if (streams_.find(info.stream_id) != streams_.end()) {
         return MakeError("Stream " + info.stream_id + " already exists");
@@ -175,18 +180,40 @@ VoidResult StreamManager::AddStream(const StreamInfo& info) {
 }
 
 VoidResult StreamManager::RemoveStream(std::string_view stream_id) {
-    std::lock_guard<std::mutex> lock(streams_mutex_);
+    std::string stream_id_str{stream_id};
+    std::unique_ptr<StreamProcessor> processor_to_stop;
 
-    auto it = streams_.find(stream_id);
-    if (it == streams_.end()) {
-        return MakeError("Stream " + std::string(stream_id) + " not found");
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+
+        auto it = streams_.find(stream_id);
+        if (it == streams_.end()) {
+            return MakeError("Stream " + stream_id_str + " not found");
+        }
+
+        // Mark as removing (防御 code)
+        removing_streams_.insert(stream_id_str);
+
+        // Move processor out of map
+        processor_to_stop = std::move(it->second);
+        streams_.erase(it);
     }
 
-    // Stop and remove
-    it->second->Stop();
-    streams_.erase(it);
+    // Stop outside of lock to prevent deadlock
+    if (processor_to_stop) {
+        processor_to_stop->Stop();
+        processor_to_stop.reset();  // Ensure full destruction
+    }
 
-    LogInfo("Stream removed: " + std::string(stream_id));
+    LogInfo("Stream removed: " + stream_id_str);
+
+    // Small delay then remove from set
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    {
+        std::lock_guard<std::mutex> lock(streams_mutex_);
+        removing_streams_.erase(stream_id_str);
+    }
+
     return MakeOk();
 }
 
