@@ -744,35 +744,40 @@ std::vector<Detection> HailoInference::ParseRawYoloOutput(
     int p4_dfl = -1, p4_class = -1, p4_kp = -1;
     int p5_dfl = -1, p5_class = -1, p5_kp = -1;
 
+    // Dynamic num_classes from labels (fallback to 13 for backward compatibility)
+    const int num_classes = labels_.empty() ? 13 : static_cast<int>(labels_.size());
+    const int num_kp_channels = (num_keypoints_ > 0) ? num_keypoints_ * 3 : 12;
+
     for (size_t i = 0; i < output_buffers.size(); ++i) {
         size_t num_floats = output_buffers[i].size() / sizeof(float);
 
         // P3 (120×120)
         if (num_floats == 120*120*64) p3_dfl = i;
-        else if (num_floats == 120*120*13) p3_class = i;
-        else if (num_floats == 120*120*12) p3_kp = i;
+        else if (num_floats == static_cast<size_t>(120*120*num_classes)) p3_class = i;
+        else if (num_floats == static_cast<size_t>(120*120*num_kp_channels)) p3_kp = i;
         // P4 (60×60)
         else if (num_floats == 60*60*64) p4_dfl = i;
-        else if (num_floats == 60*60*13) p4_class = i;
-        else if (num_floats == 60*60*12) p4_kp = i;
+        else if (num_floats == static_cast<size_t>(60*60*num_classes)) p4_class = i;
+        else if (num_floats == static_cast<size_t>(60*60*num_kp_channels)) p4_kp = i;
         // P5 (30×30)
         else if (num_floats == 30*30*64) p5_dfl = i;
-        else if (num_floats == 30*30*13) p5_class = i;
-        else if (num_floats == 30*30*12) p5_kp = i;
+        else if (num_floats == static_cast<size_t>(30*30*num_classes)) p5_class = i;
+        else if (num_floats == static_cast<size_t>(30*30*num_kp_channels)) p5_kp = i;
     }
 
     // Build scale configs for available scales
     if (p3_dfl >= 0 && p3_class >= 0) {
-        scales.push_back({120, 120, 8, p3_dfl, p3_class, p3_kp, 13});
+        scales.push_back({120, 120, 8, p3_dfl, p3_class, p3_kp, num_classes});
     }
     if (p4_dfl >= 0 && p4_class >= 0) {
-        scales.push_back({60, 60, 16, p4_dfl, p4_class, p4_kp, 13});
+        scales.push_back({60, 60, 16, p4_dfl, p4_class, p4_kp, num_classes});
     }
     if (p5_dfl >= 0 && p5_class >= 0) {
-        scales.push_back({30, 30, 32, p5_dfl, p5_class, p5_kp, 13});
+        scales.push_back({30, 30, 32, p5_dfl, p5_class, p5_kp, num_classes});
     }
 
     if (debug_count == 1) {
+        LogInfo("  num_classes=" + std::to_string(num_classes) + ", num_kp_channels=" + std::to_string(num_kp_channels));
         LogInfo("  P3 outputs: dfl=" + std::to_string(p3_dfl) + " class=" + std::to_string(p3_class) + " kp=" + std::to_string(p3_kp));
         LogInfo("  P4 outputs: dfl=" + std::to_string(p4_dfl) + " class=" + std::to_string(p4_class) + " kp=" + std::to_string(p4_kp));
         LogInfo("  P5 outputs: dfl=" + std::to_string(p5_dfl) + " class=" + std::to_string(p5_class) + " kp=" + std::to_string(p5_kp));
