@@ -889,6 +889,14 @@ void StreamProcessor::ProcessDetections(GstBuffer* buffer) {
             event.events[event_id].status = result.status;
             event.events[event_id].labels = std::move(result.labels);
         }
+
+        // AngleViolation 이벤트 (키포인트 벡터 vs 라인 각도, status 0/2)
+        auto angle_results = event_compositor_->CheckAngleViolationEvents(
+            event.detections, width, height);
+        for (auto& [event_id, result] : angle_results) {
+            event.events[event_id].status = result.status;
+            event.events[event_id].labels = std::move(result.labels);
+        }
     }
 
     // 이미지 포함 여부
@@ -1323,6 +1331,14 @@ void StreamProcessor::OnBatchResult(
         auto line_results = event_compositor_->CheckLineEvents(
             event.detections, width, height);
         for (auto& [event_id, result] : line_results) {
+            event.events[event_id].status = result.status;
+            event.events[event_id].labels = std::move(result.labels);
+        }
+
+        // AngleViolation 이벤트 (키포인트 벡터 vs 라인 각도, status 0/2)
+        auto angle_results = event_compositor_->CheckAngleViolationEvents(
+            event.detections, width, height);
+        for (auto& [event_id, result] : angle_results) {
             event.events[event_id].status = result.status;
             event.events[event_id].labels = std::move(result.labels);
         }

@@ -19,15 +19,16 @@ struct Point2D {
 
 // 이벤트 타입
 enum class EventType {
-    kROI,       // 영역 감지
-    kLine,      // 라인 크로싱
-    kAnd,       // 논리 AND
-    kOr,        // 논리 OR
-    kSpeed,     // 속도 감지
-    kHM,        // 히트맵
-    kFilter,    // 필터
-    kEnEx,      // 입출 카운팅
-    kAlarm,     // 알람
+    kROI,              // 영역 감지
+    kLine,             // 라인 크로싱
+    kAngleViolation,   // 각도 위반
+    kAnd,              // 논리 AND
+    kOr,               // 논리 OR
+    kSpeed,            // 속도 감지
+    kHM,               // 히트맵
+    kFilter,           // 필터
+    kEnEx,             // 입출 카운팅
+    kAlarm,            // 알람
     kUnknown
 };
 
@@ -80,6 +81,9 @@ struct EventSetting {
     std::vector<int> keypoints;           // 감지할 키포인트 인덱스 [1, 2] 등
     float warning_distance{0.1f};         // WARNING 영역 거리 (정규화 좌표)
 
+    // AngleViolation 옵션
+    float angle_threshold{0.0f};          // 각도 임계값 (도 단위)
+
     // And/Or 옵션
     bool in_order{false};
     std::string ncond;                    // ">=2" 등
@@ -100,6 +104,12 @@ struct EventSetting {
 // Line 이벤트 결과
 struct LineEventResult {
     int status{0};                        // 0=SAFE, 1=WARNING, 2=DANGER
+    std::vector<std::string> labels;      // 해당 라벨들
+};
+
+// AngleViolation 이벤트 결과
+struct AngleViolationResult {
+    int status{0};                        // 0=SAFE, 2=VIOLATION (WARNING 없음)
     std::vector<std::string> labels;      // 해당 라벨들
 };
 
@@ -146,6 +156,18 @@ public:
      * @return event_setting_id -> LineEventResult 맵
      */
     [[nodiscard]] std::unordered_map<std::string, LineEventResult> CheckLineEvents(
+        const std::vector<Detection>& detections,
+        int frame_width,
+        int frame_height);
+
+    /**
+     * @brief AngleViolation 이벤트 체크 (키포인트 1,2 사이 벡터와 라인 사이 각도)
+     * @param detections 현재 프레임 감지 결과
+     * @param frame_width 프레임 너비
+     * @param frame_height 프레임 높이
+     * @return event_setting_id -> AngleViolationResult 맵
+     */
+    [[nodiscard]] std::unordered_map<std::string, AngleViolationResult> CheckAngleViolationEvents(
         const std::vector<Detection>& detections,
         int frame_width,
         int frame_height);
@@ -214,6 +236,16 @@ private:
      * @return 0=SAFE, 1=WARNING, 2=DANGER
      */
     [[nodiscard]] int CheckLineEvent(
+        const EventSetting& setting,
+        const Detection& det,
+        int frame_width,
+        int frame_height) const;
+
+    /**
+     * @brief AngleViolation 이벤트 체크 (단일 detection)
+     * @return 0=SAFE, 2=VIOLATION
+     */
+    [[nodiscard]] int CheckAngleViolationEvent(
         const EventSetting& setting,
         const Detection& det,
         int frame_width,

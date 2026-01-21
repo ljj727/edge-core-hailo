@@ -16,6 +16,7 @@ EventType ParseEventType(const std::string& type_str) {
 
     if (lower == "roi") return EventType::kROI;
     if (lower == "line") return EventType::kLine;
+    if (lower == "angleviolation") return EventType::kAngleViolation;
     if (lower == "and") return EventType::kAnd;
     if (lower == "or") return EventType::kOr;
     if (lower == "speed") return EventType::kSpeed;
@@ -174,6 +175,9 @@ VoidResult EventCompositor::ParseSettings(const std::string& json_str) {
             }
             if (config.contains("warningDistance")) {
                 setting.warning_distance = config["warningDistance"].get<float>();
+            }
+            if (config.contains("angleThreshold")) {
+                setting.angle_threshold = config["angleThreshold"].get<float>();
             }
             if (config.contains("inOrder")) {
                 setting.in_order = config["inOrder"].get<bool>();
@@ -476,52 +480,35 @@ int EventCompositor::CheckLineEvent(
         return 0;
     }
 
+    // 키포인트가 없으면 이벤트 처리 안 함
+    if (det.keypoints.empty()) {
+        return 0;
+    }
+
     const Point2D& line_a = setting.points[0];
     const Point2D& line_b = setting.points[1];
 
-    // 키포인트가 없거나 설정된 키포인트 인덱스가 없으면 bbox 기준점 사용
-    if (det.keypoints.empty() || setting.keypoints.empty()) {
-        Point2D point = GetDetectionPoint(det, setting.detection_point,
-                                          frame_width, frame_height);
-
-        float distance = PointToLineDistance(point, line_a, line_b);
-        float side = PointLineSide(point, line_a, line_b);
-
-        // direction에 따른 판정 (화면 좌표계: Y축 아래로 증가)
-        // A2B: A→B 벡터 기준 오른쪽이 danger (side > 0)
-        // B2A: A→B 벡터 기준 왼쪽이 danger (side < 0)
-        bool on_danger_side = false;
-        if (setting.direction == LineDirection::kA2B) {
-            on_danger_side = (side > 0);  // 화면좌표계 보정
-        } else if (setting.direction == LineDirection::kB2A) {
-            on_danger_side = (side < 0);  // 화면좌표계 보정
-        } else {
-            // BOTH: 라인 근처면 WARNING, 아무 쪽이든 넘어가면 DANGER
-            if (distance < setting.warning_distance) {
-                return 1;  // WARNING
-            }
-            return 0;  // SAFE (BOTH에서는 DANGER 없음)
+    // 체크할 키포인트 인덱스 목록 결정
+    // setting.keypoints가 비어있으면 모든 키포인트 체크
+    std::vector<int> kp_indices;
+    if (setting.keypoints.empty()) {
+        for (int i = 0; i < static_cast<int>(det.keypoints.size()); ++i) {
+            kp_indices.push_back(i);
         }
-
-        if (on_danger_side) {
-            return 2;  // DANGER - 라인 넘어감
-        } else if (distance < setting.warning_distance) {
-            return 1;  // WARNING - 라인 근처
-        }
-        return 0;  // SAFE
+    } else {
+        kp_indices = setting.keypoints;
     }
 
     // 키포인트 기반 판정
     int max_status = 0;
 
-    for (int kp_idx : setting.keypoints) {
+    for (int kp_idx : kp_indices) {
         // 키포인트 인덱스 범위 체크 (0-based)
         if (kp_idx < 0 || kp_idx >= static_cast<int>(det.keypoints.size())) {
             continue;
         }
-        int idx = kp_idx;
 
-        const auto& kp = det.keypoints[idx];
+        const auto& kp = det.keypoints[kp_idx];
 
         // visibility 체크 (너무 낮으면 스킵)
         if (kp.visible < 0.3f) {
@@ -533,16 +520,6 @@ int EventCompositor::CheckLineEvent(
 
         float distance = PointToLineDistance(point, line_a, line_b);
         float side = PointLineSide(point, line_a, line_b);
-
-        // Debug: Line event calculation
-        static int line_debug_count = 0;
-        if (line_debug_count++ < 30) {
-            LogInfo("Line[" + setting.event_setting_id + "] kp" + std::to_string(kp_idx) +
-                    ": pos=(" + std::to_string(point.x) + "," + std::to_string(point.y) +
-                    ") dist=" + std::to_string(distance) +
-                    " warn=" + std::to_string(setting.warning_distance) +
-                    " side=" + std::to_string(side));
-        }
 
         int status = 0;
 
@@ -605,6 +582,130 @@ std::unordered_map<std::string, LineEventResult> EventCompositor::CheckLineEvent
         // 모든 detection에 대해 체크
         for (const auto& det : detections) {
             int status = CheckLineEvent(setting, det, frame_width, frame_height);
+
+            if (status > result.status) {
+                result.status = status;
+            }
+
+            // 이 detection이 이벤트에 해당하면 라벨 추가
+            if (status > 0) {
+                // 중복 체크
+                auto it = std::find(result.labels.begin(), result.labels.end(), det.class_name);
+                if (it == result.labels.end()) {
+                    result.labels.push_back(det.class_name);
+                }
+            }
+        }
+
+        results[id] = std::move(result);
+    }
+
+    return results;
+}
+
+// ============================================================================
+// AngleViolation Event Detection
+// ============================================================================
+
+int EventCompositor::CheckAngleViolationEvent(
+    const EventSetting& setting,
+    const Detection& det,
+    int frame_width,
+    int frame_height) const {
+
+    // 타겟 필터 매칭 확인
+    if (!MatchesTarget(det, setting.target)) {
+        return 0;  // SAFE - 대상 아님
+    }
+
+    // 라인 좌표 필요 (2점)
+    if (setting.points.size() < 2) {
+        return 0;
+    }
+
+    // 키포인트가 최소 3개 필요 (index 1, 2 사용)
+    if (det.keypoints.size() < 3) {
+        return 0;
+    }
+
+    const auto& kp1 = det.keypoints[1];
+    const auto& kp2 = det.keypoints[2];
+
+    // visibility 체크
+    if (kp1.visible < 0.3f || kp2.visible < 0.3f) {
+        return 0;
+    }
+
+    // 키포인트 벡터: kp2 - kp1
+    float kp_dx = kp2.x - kp1.x;
+    float kp_dy = kp2.y - kp1.y;
+
+    // 라인 벡터: point[1] - point[0]
+    const Point2D& line_a = setting.points[0];
+    const Point2D& line_b = setting.points[1];
+    float line_dx = line_b.x - line_a.x;
+    float line_dy = line_b.y - line_a.y;
+
+    // 벡터 크기
+    float kp_len = std::sqrt(kp_dx * kp_dx + kp_dy * kp_dy);
+    float line_len = std::sqrt(line_dx * line_dx + line_dy * line_dy);
+
+    // 크기가 0이면 계산 불가
+    if (kp_len < 1e-6f || line_len < 1e-6f) {
+        return 0;
+    }
+
+    // 내적 (dot product)
+    float dot = kp_dx * line_dx + kp_dy * line_dy;
+
+    // cos(angle) = dot / (|v1| * |v2|)
+    float cos_angle = dot / (kp_len * line_len);
+
+    // clamp to [-1, 1] to avoid acos domain error
+    cos_angle = std::max(-1.0f, std::min(1.0f, cos_angle));
+
+    // 각도 계산 (라디안 -> 도)
+    float angle_rad = std::acos(cos_angle);
+    float angle_deg = angle_rad * 180.0f / static_cast<float>(M_PI);
+
+    // 항상 예각 사용 (90도 초과시 180 - angle)
+    if (angle_deg > 90.0f) {
+        angle_deg = 180.0f - angle_deg;
+    }
+
+    // 임계값 체크
+    if (angle_deg > setting.angle_threshold) {
+        return 2;  // VIOLATION
+    }
+
+    return 0;  // SAFE
+}
+
+std::unordered_map<std::string, AngleViolationResult> EventCompositor::CheckAngleViolationEvents(
+    const std::vector<Detection>& detections,
+    int frame_width,
+    int frame_height) {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    std::unordered_map<std::string, AngleViolationResult> results;
+
+    if (settings_.empty() || detections.empty()) {
+        return results;
+    }
+
+    // 모든 AngleViolation 이벤트에 대해 체크
+    for (const auto& [id, setting] : settings_) {
+        if (setting.event_type != EventType::kAngleViolation) {
+            continue;
+        }
+
+        AngleViolationResult result;
+        result.status = 0;  // SAFE
+
+        // 모든 detection에 대해 체크
+        for (const auto& det : detections) {
+            int status = CheckAngleViolationEvent(setting, det, frame_width, frame_height);
 
             if (status > result.status) {
                 result.status = status;
