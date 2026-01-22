@@ -480,24 +480,16 @@ int EventCompositor::CheckLineEvent(
         return 0;
     }
 
-    // 키포인트가 없으면 이벤트 처리 안 함
-    if (det.keypoints.empty()) {
+    // 키포인트가 최소 3개 필요 (index 1, 2 사용)
+    if (det.keypoints.size() < 3) {
         return 0;
     }
 
     const Point2D& line_a = setting.points[0];
     const Point2D& line_b = setting.points[1];
 
-    // 체크할 키포인트 인덱스 목록 결정
-    // setting.keypoints가 비어있으면 모든 키포인트 체크
-    std::vector<int> kp_indices;
-    if (setting.keypoints.empty()) {
-        for (int i = 0; i < static_cast<int>(det.keypoints.size()); ++i) {
-            kp_indices.push_back(i);
-        }
-    } else {
-        kp_indices = setting.keypoints;
-    }
+    // 키포인트 1, 2 하드코딩 (side 감지용)
+    std::vector<int> kp_indices = {1, 2};
 
     // 키포인트 기반 판정
     int max_status = 0;
