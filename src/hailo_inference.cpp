@@ -748,21 +748,25 @@ std::vector<Detection> HailoInference::ParseRawYoloOutput(
     const int num_classes = labels_.empty() ? 13 : static_cast<int>(labels_.size());
     const int num_kp_channels = (num_keypoints_ > 0) ? num_keypoints_ * 3 : 12;
 
+    // Map outputs by tensor NAME (not size - size can collide when num_classes=16)
+    // conv43/44/45 = P3 (DFL/Class/KP)
+    // conv57/58/59 = P4 (DFL/Class/KP)
+    // conv70/71/72 = P5 (DFL/Class/KP)
     for (size_t i = 0; i < output_buffers.size(); ++i) {
-        size_t num_floats = output_buffers[i].size() / sizeof(float);
+        std::string name = output_vstreams_[i].name();
 
-        // P3 (120×120)
-        if (num_floats == 120*120*64) p3_dfl = i;
-        else if (num_floats == static_cast<size_t>(120*120*num_classes)) p3_class = i;
-        else if (num_floats == static_cast<size_t>(120*120*num_kp_channels)) p3_kp = i;
-        // P4 (60×60)
-        else if (num_floats == 60*60*64) p4_dfl = i;
-        else if (num_floats == static_cast<size_t>(60*60*num_classes)) p4_class = i;
-        else if (num_floats == static_cast<size_t>(60*60*num_kp_channels)) p4_kp = i;
-        // P5 (30×30)
-        else if (num_floats == 30*30*64) p5_dfl = i;
-        else if (num_floats == static_cast<size_t>(30*30*num_classes)) p5_class = i;
-        else if (num_floats == static_cast<size_t>(30*30*num_kp_channels)) p5_kp = i;
+        // P3 outputs
+        if (name.find("conv43") != std::string::npos) p3_dfl = i;
+        else if (name.find("conv44") != std::string::npos) p3_class = i;
+        else if (name.find("conv45") != std::string::npos) p3_kp = i;
+        // P4 outputs
+        else if (name.find("conv57") != std::string::npos) p4_dfl = i;
+        else if (name.find("conv58") != std::string::npos) p4_class = i;
+        else if (name.find("conv59") != std::string::npos) p4_kp = i;
+        // P5 outputs
+        else if (name.find("conv70") != std::string::npos) p5_dfl = i;
+        else if (name.find("conv71") != std::string::npos) p5_class = i;
+        else if (name.find("conv72") != std::string::npos) p5_kp = i;
     }
 
     // Build scale configs for available scales
